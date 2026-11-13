@@ -8,18 +8,34 @@ import yfinance as yf
 
 DB_PATH = os.environ.get("DB_PATH", "trading212_stocks.db")
 
-# Fixed HTTPS host so the API key is never sent elsewhere.
-T212_BASE_URL = "https://live.trading212.com/api/v0"
+# Fixed HTTPS hosts so the API key is never sent elsewhere; T212_ENVIRONMENT picks one.
+T212_BASE_URLS = {
+    "live": "https://live.trading212.com/api/v0",
+    "demo": "https://demo.trading212.com/api/v0",
+}
 INSTRUMENTS_ENDPOINT = "/equity/metadata/instruments"
 REQUEST_TIMEOUT = 30
 BATCH_SIZE = 50
 
-# T212 tickers: US is "AAPL_US_EQ"; other markets append a lowercase exchange
-# letter to the symbol, e.g. "BPl_EQ" (London). Only letters confirmed from
-# public T212 examples are mapped; anything else is counted as unmapped.
+# T212 ticker endings -> (Yahoo suffix, exchange), derived from the real instruments list.
+# "<SYMBOL>_<country>_EQ", e.g. "AAPL_US_EQ":
+COUNTRY_CODES = {
+    "US": ("", "US"),
+    "CA": (".TO", "TSX"),
+    "PT": (".LS", "LISBON"),
+    "AT": (".VI", "VIENNA"),
+    "BE": (".BR", "BRUSSELS"),
+    "BB": (".BR", "BRUSSELS"),
+}
+# "<SYMBOL><letter>_EQ", e.g. "BPl_EQ". German "d" listings resolve on Yahoo as Frankfurt (.F).
+# Anything else (rare endings, secondary "l1"/"d1" listings) is counted as unmapped.
 EXCHANGE_LETTERS = {
     "l": (".L", "LSE"),
-    "d": (".DE", "XETRA"),
+    "d": (".F", "FRANKFURT"),
+    "p": (".PA", "PARIS"),
+    "e": (".MC", "MADRID"),
+    "s": (".SW", "SIX"),
+    "a": (".AS", "AMSTERDAM"),
 }
 
 
@@ -52,10 +68,13 @@ def fetch_instruments() -> list[dict]:
     key = os.environ.get("T212_API_KEY")
     if not key:
         raise ValueError("T212_API_KEY environment variable is required; no request made.")
+    environment = os.environ.get("T212_ENVIRONMENT", "live")
+    if environment not in T212_BASE_URLS:
+        raise ValueError("T212_ENVIRONMENT must be 'live' or 'demo'; no request made.")
     secret = os.environ.get("T212_API_SECRET")
     # Key + secret uses HTTP Basic; a legacy key alone goes in the Authorization header.
     auth = {"auth": (key, secret)} if secret else {"headers": {"Authorization": key}}
-    resp = requests.get(T212_BASE_URL + INSTRUMENTS_ENDPOINT, timeout=REQUEST_TIMEOUT, **auth)
+    resp = requests.get(T212_BASE_URLS[environment] + INSTRUMENTS_ENDPOINT, timeout=REQUEST_TIMEOUT, **auth)
     resp.raise_for_status()
     return resp.json()
 
@@ -65,16 +84,14 @@ def to_yahoo(ticker: str) -> tuple[str, str] | None:
 
     Returns None for non-equity, malformed or unmapped tickers.
     """
-    if ticker.endswith("_US_EQ"):
-        symbol = ticker[: -len("_US_EQ")]
-        return (symbol, "US") if symbol and "_" not in symbol else None
-    if not ticker.endswith("_EQ"):
-        return None
-    symbol, letter = ticker[:-4], ticker[-4:-3]
-    if not symbol or "_" in symbol or letter not in EXCHANGE_LETTERS:
-        return None
-    suffix, exchange = EXCHANGE_LETTERS[letter]
-    return symbol + suffix, exchange
+    parts = ticker.split("_")
+    if len(parts) == 3 and parts[0] and parts[1] in COUNTRY_CODES and parts[2] == "EQ":
+        suffix, exchange = COUNTRY_CODES[parts[1]]
+        return parts[0] + suffix, exchange
+    if len(parts) == 2 and len(parts[0]) > 1 and parts[0][-1] in EXCHANGE_LETTERS and parts[1] == "EQ":
+        suffix, exchange = EXCHANGE_LETTERS[parts[0][-1]]
+        return parts[0][:-1] + suffix, exchange
+    return None
 
 
 def compute_metrics(hist: pd.DataFrame, year: int) -> dict:

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Trading 212 Stocks</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+  th { background: #f4f4f4; cursor: pointer; }
+  tr:nth-child(even) { background: #fafafa; }
+  form { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+  label { font-size: 0.9em; display: flex; align-items: center; gap: 4px; }
+  input[type="text"], select { padding: 6px; }
+  button { padding: 6px 12px; }
+  .summary { margin-bottom: 16px; font-size: 0.9em; color: #555; }
+  .error { color: #b00; }
+</style>
+</head>
+<body>
+<h1>Trading 212 Stocks</h1>
+
+{% if running %}
+<div class="summary">Sync running…</div>
+{% endif %}
+{% if summary %}
+<div class="summary">
+  Last sync: {{ summary.started_at or "—" }} &rarr; {{ summary.finished_at or "—" }}
+  {% if summary.error %}
+    <span class="error">Error: {{ summary.error }}</span>
+  {% else %}
+    OK: {{ summary.ok }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}
+  {% endif %}
+</div>
+{% endif %}
+
+<form method="get" action="{{ url_for('index') }}">
+  <label>Status:
+    <select name="status">
+      <option value="" {% if not status %}selected{% endif %}>All</option>
+      <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
+      <option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>
+      <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
+    </select>
+  </label>
+  <label>Search:
+    <input type="text" name="q" value="{{ q }}">
+  </label>
+  <label>Sort:
+    <select name="sort">
+      <option value="ticker" {% if sort == "ticker" %}selected{% endif %}>Ticker</option>
+      <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
+      <option value="status_tag" {% if sort == "status_tag" %}selected{% endif %}>Status</option>
+    </select>
+    <select name="dir">
+      <option value="asc" {% if direction == "asc" %}selected{% endif %}>Asc</option>
+      <option value="desc" {% if direction == "desc" %}selected{% endif %}>Desc</option>
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+</form>
+<form method="post" action="{{ url_for('sync_now') }}">
+  <button type="submit">Sync Now</button>
+</form>
+
+<table>
+  <thead>
+    <tr>
+      <th>Ticker</th><th>Name</th><th>Exchange</th><th>Open</th><th>Year High</th><th>Year Low</th><th>All-Time High</th><th>All-Time Low</th><th>Status</th><th>Updated</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row["ticker"] }}</td>
+      <td>{{ row["name"] or "—" }}</td>
+      <td>{{ row["exchange"] or "—" }}</td>
+      <td>{{ "%.2f" % row["opening_price"] if row["opening_price"] is not none else "—" }}</td>
+      <td>{{ "%.2f" % row["year_max"] if row["year_max"] is not none else "—" }}</td>
+      <td>{{ "%.2f" % row["year_min"] if row["year_min"] is not none else "—" }}</td>
+      <td>{{ "%.2f" % row["all_time_max"] if row["all_time_max"] is not none else "—" }}</td>
+      <td>{{ "%.2f" % row["all_time_min"] if row["all_time_min"] is not none else "—" }}</td>
+      <td>{{ row["status_tag"] }}</td>
+      <td>{{ row["last_updated"] or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p>{{ rows|length }} row(s) shown (capped at {{ row_cap }}).</p>
+</body>
+</html>

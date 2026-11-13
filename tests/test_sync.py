@@ -17,8 +17,25 @@ class TestToYahoo(unittest.TestCase):
     def test_london_ticker(self):
         self.assertEqual(sync.to_yahoo("BPl_EQ"), ("BP.L", "LSE"))
 
-    def test_xetra_ticker(self):
-        self.assertEqual(sync.to_yahoo("SXR8d_EQ"), ("SXR8.DE", "XETRA"))
+    def test_german_ticker(self):
+        self.assertEqual(sync.to_yahoo("TLSd_EQ"), ("TLS.F", "FRANKFURT"))
+
+    def test_euronext_and_other_letter_tickers(self):
+        self.assertEqual(sync.to_yahoo("SUp_EQ"), ("SU.PA", "PARIS"))
+        self.assertEqual(sync.to_yahoo("MTa_EQ"), ("MT.AS", "AMSTERDAM"))
+        self.assertEqual(sync.to_yahoo("FCCe_EQ"), ("FCC.MC", "MADRID"))
+        self.assertEqual(sync.to_yahoo("NESNs_EQ"), ("NESN.SW", "SIX"))
+
+    def test_country_code_tickers(self):
+        self.assertEqual(sync.to_yahoo("WELL_CA_EQ"), ("WELL.TO", "TSX"))
+        self.assertEqual(sync.to_yahoo("JMT_PT_EQ"), ("JMT.LS", "LISBON"))
+        self.assertEqual(sync.to_yahoo("AMS2_AT_EQ"), ("AMS2.VI", "VIENNA"))
+        self.assertEqual(sync.to_yahoo("VGP_BE_EQ"), ("VGP.BR", "BRUSSELS"))
+        self.assertEqual(sync.to_yahoo("VAN_BB_EQ"), ("VAN.BR", "BRUSSELS"))
+
+    def test_secondary_and_odd_listings_unmapped(self):
+        for t in ("SWCl1_EQ", "CEZd1_EQ", "TPR_EQ_US", "ABBNsEQ", "YUMC", "PRNI_EQ"):
+            self.assertIsNone(sync.to_yahoo(t), t)
 
     def test_unknown_exchange_letter_returns_none(self):
         self.assertIsNone(sync.to_yahoo("ABCz_EQ"))
@@ -154,6 +171,20 @@ class TestFetchInstruments(unittest.TestCase):
         self.assertEqual(kwargs["auth"], ("k-123", "s-456"))
         self.assertEqual(kwargs["timeout"], sync.REQUEST_TIMEOUT)
 
+    @patch.dict(os.environ, {"T212_API_KEY": "k-123", "T212_ENVIRONMENT": "demo"}, clear=True)
+    @patch("sync.requests.get")
+    def test_demo_environment_uses_demo_host(self, get):
+        get.return_value.json.return_value = []
+        sync.fetch_instruments()
+        self.assertEqual(get.call_args.args[0], "https://demo.trading212.com/api/v0/equity/metadata/instruments")
+
+    @patch.dict(os.environ, {"T212_API_KEY": "k-123", "T212_ENVIRONMENT": "evil.example.com"}, clear=True)
+    @patch("sync.requests.get")
+    def test_unknown_environment_raises_without_request(self, get):
+        with self.assertRaises(ValueError):
+            sync.fetch_instruments()
+        get.assert_not_called()
+
     @patch.dict(os.environ, {"T212_API_KEY": "k-123"}, clear=True)
     @patch("sync.requests.get")
     def test_legacy_key_uses_authorization_header(self, get):
@@ -166,7 +197,7 @@ class TestFetchInstruments(unittest.TestCase):
     def test_http_error_does_not_contain_key(self, get):
         resp = requests.Response()
         resp.status_code = 401
-        resp.url = sync.T212_BASE_URL + sync.INSTRUMENTS_ENDPOINT
+        resp.url = sync.T212_BASE_URLS["live"] + sync.INSTRUMENTS_ENDPOINT
         get.return_value = resp
         with self.assertRaises(requests.HTTPError) as ctx:
             sync.fetch_instruments()

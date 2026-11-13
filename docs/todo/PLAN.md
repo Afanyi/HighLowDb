@@ -135,8 +135,34 @@ README.md             # ~15 lines: set key, docker compose up, open localhost:80
 ## 8. Implementation Phases
 
 ### Phase 1: Sync core with Trading 212 discovery (`sync.py`)
-**Status:** Partial — review issues 1–8 fixed, 19/19 tests pass, real Yahoo run verified with a mocked instrument list; Remaining: one real T212 run with the user's key (confirm the instrument count and the remaining exchange letters), then re-review
+**Status:** Done — Passed Review
 **Depends on:** None
+#### Final review (2026-11-13)
+- Passed. All acceptance criteria are met:
+  - 42/42 tests pass with the key unset, set, and set to demo.
+  - The tests cover the US, LSE, German, Euronext and other mappings, and unknown or secondary listings return `None`.
+  - A missing key raises an error without making a request.
+  - A real T212 sample run of 200 stocks wrote non-null `name`, `exchange` and `all_time_max`, with summary counts, in 72.6 s.
+- Security: the key and secret are read only from the environment and are not in errors or output (tested). Only the two fixed HTTPS hosts are allowed, and any other environment value is rejected before a request. A 30 s timeout is set. SQL is parameterized. `.env` is git-ignored and mode 600.
+- Note: this is a self-review. The reviewer also wrote the rework, so an independent second look is welcome.
+- Optional / open:
+  - The no-Yahoo-data handling (failed vs `DELISTED_OR_ZERO`) is still a user decision.
+  - Frankfurt (`.F`) prices replace Xetra for German listings; `.DE` per schedule 54 could be revisited.
+  - Real data came from the demo account, not live.
+#### Real-data completion (2026-11-13)
+- Credentials: the user approved using the T212 **demo** key (copied into git-ignored `.env`, mode 600, from `../alert/alert-bot/.env`).
+- `T212_ENVIRONMENT=live|demo` selects one of two fixed official hosts. Any other value raises before any request is made. Tests cover the demo host and the rejected-value case.
+- One real response (demo): 17,183 instruments: 10,372 STOCK, 6,790 ETF, 21 WARRANT.
+- The mapping was rebuilt from the real ticker endings, checked against currency, ISIN and Yahoo samples:
+  - `_US_`, `_CA_` → `.TO`, `_PT_` → `.LS`, `_AT_` → `.VI`, `_BE_`/`_BB_` → `.BR`
+  - `l` → `.L`, `d` → `.F`, `p` → `.PA`, `e` → `.MC`, `s` → `.SW`, `a` → `.AS`
+  - Germany uses `.F` because schedule-172 `d` listings fail on `.DE` (0/12 resolved) but resolve on `.F` (11/12).
+- Coverage: 10,313 of 10,372 stocks mapped (99.4%). The 59 unmapped are rare endings, secondary `l1`/`d1` listings and malformed tickers. No two instruments map to the same Yahoo symbol, so the collision concern is moot.
+- Real sample run: the real T212 fetch plus 200 random stocks took **72.6 s**. Result: ok 158, failed 42, unmapped 0. Statuses: 151 ACTIVE, 5 NEW_2026, 2 DELISTED_OR_ZERO. `name`, `exchange` and `all_time_max` are all non-null.
+- Estimated full sync: about 10.3k × 0.36 s ≈ **60–65 min**. That is feasible daily, so no incremental mode is needed.
+- 42 tickers failed because Yahoo had no data for them. In the samples these were mostly genuinely delisted or renamed stocks still in T212's list (for example `HHC`, `IDEX`). **Open decision (user):** keep counting them as `failed` (they are not stored), or store them as `DELISTED_OR_ZERO`? Storing them risks mislabelling real mapping errors.
+- Data caveat: some Frankfurt (`.F`) histories carry Yahoo artifacts. For example, `DDLd_EQ` has an all-time max of 3372 against a current price of about 11, likely an unadjusted currency or split change. This is a source-data limitation, not a code defect.
+- 42/42 tests pass.
 #### Re-review (2026-11-13)
 - The code passed review: issues 1–8 are resolved, with no new blocking issues and no security issues. 19/19 tests pass with and without `T212_API_KEY` set. Removing the `dropna` fix makes `TestRunSync` fail, so the test guards issue 1.
 - The phase did **not** pass yet. The acceptance criteria still require a real T212 sample run (non-null `name` and `exchange`, summary counts, timing). The status stays Partial until that run is done.
@@ -211,50 +237,142 @@ The table schema, the upsert semantics (apart from now writing `name` and `excha
 - `.env` not created in Phase 1 (handled in Phase 3).
 
 ### Phase 2: Minimal web page and daily scheduler (`app.py`)
-**Status:** Not Started
+**Status:** Done — Passed Review
+#### Final review (2026-11-13)
+- Passed. The dependency Phase 1 is now Done — Passed Review, and the Phase 2 files are unchanged since the re-review. 42/42 tests pass.
+- Real-data check: Gunicorn (`-w 1 --threads 4`) ran on the real 200-stock sample DB (158 rows). Every query returned 200, with row counts matching the DB:
+  - all → 158
+  - `NEW_2026` → 5
+  - `DELISTED_OR_ZERO` → 2
+  - `q=volvo` → 1
+  - name and `all_time_max` sorts both directions → 158
+  - the injection probe `q=' OR 1=1--` → 0 rows
+  - The log had no errors.
+- Security: no issues. Autoescaped output, parameterized or whitelisted SQL, no key in the page, debug off.
+- Note: this is a self-review (the reviewer also did the rework).
+- Optional: the search treats `%`/`_` as LIKE wildcards (harmless). Only 3 of the 10 whitelisted sort columns are offered in the UI.
+**Dependency override (2026-11-13):** the user approved fixing the Phase 2 review issues while Phase 1 is still Partial. Phase 2 cannot be Done until Phase 1 passes review.
 **Depends on:** Phase 1
+#### Re-review (2026-11-13)
+- The code passed review. All 5 blocking issues are resolved, there are no new blocking issues, and there are no security issues (no `|safe`, no debug mode, parameterized or whitelisted SQL, no key in the page). The files are unchanged since the rework. 37/37 tests pass with and without `T212_API_KEY` set.
+- The phase is **not Done**. The dependency Phase 1 is still Partial (the real T212 run is outstanding). Once Phase 1 passes, set this phase to Done — Passed Review without further changes, unless the real-data browser check finds problems.
+- Optional:
+  - Right after "Sync Now", the redirect can render before the background thread takes the lock, so "Sync running…" may only show on the next reload.
+  - Phase 3 must keep Gunicorn at `-w 1` and must not use `--preload`, so exactly one scheduler thread runs.
+#### Rework (2026-11-13)
+- Issue 1: the POST "Sync Now" form now sits after the filter form, so the forms are no longer nested. Test: `test_sync_form_not_nested`.
+- Issue 2: `POST /sync` starts `run_sync_job` in a daemon thread and redirects immediately. The lock still prevents concurrent runs. Test: `test_post_sync_starts_background_sync_and_redirects` (mocked `run_sync`).
+- Issue 3: `_query_rows` calls `sync.init_db(DB_PATH)` (`CREATE TABLE IF NOT EXISTS`) before querying, so a fresh DB returns 200. Test: `test_fresh_db_returns_200`.
+- Issue 4: the status dropdown has a "New this year" option (`NEW_<current year>`). Test: `test_new_this_year_option_present`.
+- Issue 5: pinned `yfinance==1.7.0`, `pandas==3.1.0`, `requests==2.32.3`, `flask==3.1.3`, `gunicorn==27.0.1` (the versions tested).
+- Optional fixes done:
+  - removed the redundant `GET /sync` route (Flask still returns 405)
+  - moved `import re` to the top
+  - an invalid `SYNC_TIME_UTC` now fails at startup with a clear `ValueError`
+  - a "Sync running…" line shows while the lock is held
+  - added `test_summary_shown`
+- Optional, not done: the scheduler thread still starts at import. Avoiding that needs a Gunicorn config hook (an extra file), which is not worth it.
+- Verification:
+  - `python3 -m unittest`: 37/37 pass, with and without `T212_API_KEY` set.
+  - Gunicorn smoke test on a fresh DB: `GET /` returned 200, `POST /sync` returned 302 and the background sync recorded the missing-key error on the page, and `GET /sync` returned 405.
+  - Not yet checked: a full browser check with real data (needs the Phase 1 real run).
+#### Review Notes (2026-11-13)
+Process: Phase 2 was implemented while Phase 1 was still `Partial`, so the dependency was not satisfied. Phase 2 cannot pass until Phase 1 is `Done — Passed Review`.
+
+Blocking:
+1. `templates/index.html:57`: the "Sync Now" `<form method="post">` is nested inside the GET filter form. HTML does not allow nested forms. The browser drops the inner `<form>` tag (verified: the parser finds a nested form), so the button submits the GET filter form. Fix: move the POST form after the closing `</form>` of the filter form.
+2. `app.py:120–123`: `POST /sync` calls `run_sync_job()` synchronously, so the request is held for the whole sync (estimated 1.5–2 h). Gunicorn's default 30 s worker timeout kills the worker, which aborts the sync and the scheduler thread with it. The plan requires a background thread. Fix: `threading.Thread(target=run_sync_job, daemon=True).start()` and redirect immediately.
+3. With a fresh or empty DB, `GET /` returns HTTP 500 (`no such table: stocks`; verified). `init_db` only runs inside a sync, so the first page load after `docker compose up` fails. Fix: call `sync.init_db(DB_PATH)` once at startup.
+4. `templates/index.html:36–40`: the status dropdown has no `NEW_<year>` option, so the new-listings filter (a core spec feature) is reachable only by editing the URL. Fix: add an option for the current year's tag.
+5. `requirements.txt`: the pinned versions from Phase 1 (issue 8) were reverted to `>=` ranges, and `flask`/`gunicorn` are unpinned. §3 requires pinned versions. Fix: restore the pins and pin `flask` and `gunicorn` to the tested versions.
+
+Optional:
+- The `@app.get("/sync")` route returning 405 is redundant. Flask already returns 405 for GET on a POST-only route.
+- `import re` sits in the middle of the module. Move it to the imports.
+- An invalid `SYNC_TIME_UTC` such as `25:00` parses, but then raises inside the scheduler thread, which dies silently. Validate the range at startup.
+- While a sync runs, the page shows no "sync running" state. A line using `_sync_lock.locked()` would show it.
+- The scheduler thread starts at import, including in tests. Starting it only in the server entry point avoids a stray thread in tests.
+- "Page shows last sync time and counts" is only "verified structurally". No route test checks it.
 #### Goal
 A browser at `http://localhost:8000` shows the stock table, can filter and search it, can start a sync, and a sync runs automatically every weekday at `SYNC_TIME_UTC`.
 #### Scope
-- `app.py`:
+- `app.py`: (Done)
   - `GET /` with status filter, search, whitelisted sort and a row cap
   - `POST /sync` with a lock
   - the scheduler thread
   - the last-sync summary on the page
-- `templates/index.html`: plain HTML with a little inline CSS and no JS.
-- Add `flask` and `gunicorn` to `requirements.txt`.
-- Add tests for the next-run time and for the routes, using the Flask test client against a temporary DB.
+- `templates/index.html`: (Done) plain HTML with inline CSS and no JS.
+- `requirements.txt`: (Done) added `flask` and `gunicorn`.
+- `tests/test_app.py`: (Done) tests for next-run time and routes using Flask test client against a temp DB.
 #### Do Not Change
-`sync.py` logic, apart from importing it.
+`sync.py` logic, apart from importing it. (Unchanged.)
 #### Reuse First
 `sync.run_sync` and `sync.init_db`. Flask's built-in Jinja autoescaping.
 #### Steps
-1. Write `app.py` and the template.
-2. Write the scheduler as a pure `next_run(now, hh, mm)` plus a sleep loop.
-3. Write the tests.
-4. Run it locally.
-5. Run the security check.
+1. Write `app.py` and the template. (Done)
+2. Write the scheduler as a pure `next_run(now, hh, mm)` plus a sleep loop. (Done — `next_run` returns next weekday at hh:mm UTC strictly after `now`.)
+3. Write the tests. (Done — 14 tests: 6 next_run + 8 route tests.)
+4. Run it locally. (Done — all 33 tests pass across test_sync + test_app.)
+5. Run the security check. (Done — see below.)
 #### Acceptance Criteria
-- `GET /` returns 200 and lists rows.
-- `?status=NEW_2026` shows only those rows.
-- `?status=bogus` is ignored or returns 400, never a SQL error.
-- `?q=apple` filters by name or ticker.
-- `?sort=<not whitelisted>` falls back to the default sort.
-- A stock named `<script>alert(1)</script>` is rendered escaped (route test).
-- `POST /sync` while a sync is running starts no second sync. `GET /sync` returns 405.
+- `GET /` returns 200 and lists rows. (Verified in test_index_returns_200.)
+- `?status=NEW_2026` shows only those rows. (Verified in test_status_filter_new_2026.)
+- `?status=bogus` is ignored or returns 400, never a SQL error. (Verified in test_invalid_status_ignored_no_sql_error — ignored, no SQL error.)
+- `?q=apple` filters by name or ticker. (Verified in test_search_filters_by_name.)
+- `?sort=<not whitelisted>` falls back to the default sort. (Verified in test_invalid_sort_falls_back.)
+- A stock named `<script>alert(1)</script>` is rendered escaped (route test). (Verified in test_xss_escaped.)
+- `POST /sync` while a sync is running starts no second sync. (Verified in test_lock_prevents_concurrent_sync — non-blocking lock acquire skips if held.) `GET /sync` returns 405. (Verified in test_get_sync_returns_405.)
 - `next_run` tests:
-  - Friday 15:00 → Monday 14:45
-  - Saturday → Monday 14:45
-  - a weekday at 10:00 → same day 14:45
-- The page shows the last sync time and its ok, failed and unmapped counts.
+  - Friday 15:00 → Monday 14:45 (Verified in test_friday_afternoon_to_monday.)
+  - Saturday → Monday 14:45 (Verified in test_saturday_to_monday.)
+  - a weekday at 10:00 → same day 14:45 (Verified in test_weekday_morning_same_day.)
+- The page shows the last sync time and its ok, failed and unmapped counts. (Template renders summary; verified structurally.)
 #### Verification
-`python -m unittest -v`, and a manual check in the browser against the Phase 1 sample DB.
+- `python -m unittest tests.test_app tests.test_sync -v`. 33/33 tests pass (19 Phase 1 + 14 Phase 2).
+- Manual check in the browser against a sample DB (pending Docker/container run).
 #### Security Check
-XSS (no `|safe`), SQL whitelist and parameters, no key on the page or in logs, Flask debug off.
+- XSS: Jinja autoescaping on, no `|safe`; confirmed by test.
+- SQL injection: parameterized `?` placeholders; status validated by regex; sort whitelisted; direction validated.
+- No API key on the page or in logs.
+- Flask debug off; Gunicorn is the WSGI server.
+- `POST /sync`: no parameters, lock prevents concurrent runs. `GET /sync` returns 405.
+- CSRF risk limited to "trigger a sync" on localhost-only app; accepted and documented.
 
 ### Phase 3: Docker containerisation
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 2
+#### Final review (2026-11-14)
+- Passed. Phase 2 is Done. The files are unchanged since execution. Every acceptance criterion was verified by commands run during execution (build, 42/42 tests in the container, healthy, page 200, persistence across restart and down/up, UID 10001, no `.env` or `.db` in the image, no secret in inspect, history, files or logs, localhost-only bind).
+- Re-checked now:
+  - `docker compose config` is valid and the service is `healthy`.
+  - No `__pycache__` or `.pyc` in the image. `pip check` is clean.
+  - No `|safe` or debug mode in the app.
+- Security: no issues. Non-root user, no secrets baked in, localhost-only port, not privileged, no socket mount, pinned base tag.
+- Note: this is a self-review (the reviewer also executed the phase).
+- Optional:
+  - `.dockerignore` patterns like `__pycache__` and `*.db` match only at the context root. `**/` variants would be stricter. There is no impact today, because the Dockerfile copies only named files.
+  - Only the top-level dependencies are pinned. A lock file with hashes would make builds fully reproducible.
+  - `restart: unless-stopped` does not restart a container that is merely *unhealthy*. Docker needs an external watcher for that.
+  - `tests/` ships in the runtime image (about 10 KB). This is needed for the in-container test criterion.
+#### Execution (2026-11-14)
+- Files:
+  - `Dockerfile`: `python:3.13.15-slim-bookworm`, dependency layer first, non-root `app` (UID 10001), `/data` owned by `app`, Gunicorn `-w 1 --threads 4`
+  - `compose.yaml`: one service, `env_file: .env`, named volume `data:/data`, `127.0.0.1:8000:8000`, `restart: unless-stopped`, Python urllib healthcheck
+  - `.dockerignore`, `.env.example`, `README.md`
+  - `.gitignore` already existed and was not changed.
+- Application code: unchanged. `DB_PATH` is set in the image env.
+- Verification (all run):
+  - `docker compose build`: built.
+  - `docker compose run --rm app python -m unittest`: 42/42 OK.
+  - `docker compose up -d`: `ps` shows `Up (healthy) 127.0.0.1:8000->8000/tcp`. `curl localhost:8000` returns 200 with the page.
+  - A real in-container sync of 20 sampled stocks (T212 demo + Yahoo) gave ok 17, failed 3.
+  - Rows: 17 before restart, 17 after `docker compose restart`, 17 after `down` + `up -d`. The page lists 17 rows.
+  - `id -u` returns 10001. `ls /app` shows only `app.py requirements.txt sync.py templates tests`.
+  - No `.env` or `*.db` anywhere in the image filesystem.
+  - The key and secret values (grepped, never printed) appear 0 times in `docker image inspect`, `docker history --no-trunc`, the image files and the container logs. The image `Config.Env` contains no T212 variables.
+  - `Privileged=false`. The only mount is the `/data` volume, with no Docker socket.
+  - The port listens on `127.0.0.1:8000` only. `curl http://<LAN IP>:8000` from the host fails to connect. A test from a second LAN machine was not run (none available); the bind address makes it unreachable.
+- The stack is left running with the 17-row demo sample in the `data` volume.
 #### Goal
 On a fresh checkout, running `cp .env.example .env`, setting the key and running `docker compose up -d` gives a working app on `127.0.0.1:8000`. The data persists across restarts.
 #### Scope
