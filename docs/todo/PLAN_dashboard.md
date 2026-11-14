@@ -124,8 +124,76 @@ DISTANCES = {
 ## 7. Implementation Phases
 
 ### Phase 5: Bootstrap 5 dashboard and distance filters
-**Status:** Todo
+**Status:** Done — rework complete
 **Depends on:** Phase 4
+#### Rework (2026-11-14)
+- Must fix:
+  1. Page size fixed. Jinja `trim_blocks`/`lstrip_blocks` are on, the `fmt` macro has whitespace control, and each row is written on one line. With 10,300 rows the page is **4.50 MB** (was 7.44 MB) and loads in 0.36–0.41 s. The rest of the growth over Phase 4's 2.7 MB comes from the 4 extra columns, the `text-end` classes and the status badges.
+  2. The duplicate sync alert block is removed. The navbar badge is the only sync summary, and the test checks that it appears exactly once.
+  3. Level markers fixed: a single level shows `▲`/`▼`, and 2 or more levels show `▲1`, `▼2` and so on.
+  4. New tests:
+     - `test_level_markers`
+     - `test_sort_controls_prefilled`
+     - `test_header_links_keep_sort_levels_and_filters` (parses each header link and checks the sort levels after clicking the primary column and another column, plus `status`, `q`, `country` and `min_*`)
+
+     Weak tests were strengthened: the 4th level is checked as ignored, a duplicate column is checked as used once, and the old single-sort URL is checked for its actual descending order.
+- Should fix:
+  5. Only the number columns are right-aligned (`numeric_cols`).
+  6. The sticky header style lives only in the `th.sticky` CSS rule.
+  7. `_query_rows` accepts only `>=`/`<=` as `op`.
+  8. The template loops over `distance_labels`, built from `DISTANCES`, instead of matching the `pct_` prefix.
+- Optional items done:
+  - The search input is now `-sm`.
+  - `navbar-light` is removed.
+  - The unused `counts` template variable is removed.
+- Fixes found in the browser check (not visible in tests):
+  - The table was squeezed into Bootstrap's fixed-width `container`, so cells wrapped and rows became 3 lines tall. The page now uses `container-fluid`, and the table has `text-nowrap` and scrolls sideways inside its card.
+  - The Status, Country, sort and group dropdowns showed only "All" or "—" with no visible label. Every control now has a visible label linked with `for`/`id`.
+  - On phones, each sort column and its Order now share one row.
+  - Header links and group badges are no longer underlined.
+- Not changed (optional): the trailing default `ticker` level after a header click, and the second check of sort levels in `_query_rows`.
+- **Data issue found, not part of Phase 5:** the live DB holds impossible values from yfinance, for example an all-time high of `737553779962280290939461173248.00` and an all-time low of `-728702185293733075060628201144320.00` (`AKTAd_EQ`, `CISS_US_EQ`, `AYTU_US_EQ`). They make those columns very wide and their distances meaningless, so they rank near the top of "% below All-Time High". A later sync phase should reject non-positive or absurd prices.
+- Verification:
+  - Local `python3 -m unittest`: 80 tests, OK.
+  - `docker compose run --rm app python -m unittest`: OK.
+  - `docker compose up -d --build`: `Up (healthy)`, and `/health` returns `ok`.
+  - Live pages (996 rows) return 200, including grouped pages, 2-level sorts, and country plus min/max filters.
+  - Headless Chrome screenshots at 1600 px and 390 px wide were checked after the fixes.
+  - Security grep of the diff: no `|safe`, no `<script>`, and no request values in SQL f-strings.
+#### Review (2026-11-14)
+- Not yet passed. Everything planned is implemented and works, and the diff stays inside the planned files (`app.py`, the template, the tests, `README.md`). The items below must be fixed first.
+- Verification run by the reviewer:
+  - Local `python3 -m unittest`: 77 tests, OK.
+  - Timing with 10,300 synthetic rows. Every request is under the 2 s target:
+
+    | Request | Time |
+    |---|---|
+    | `/` | 0.47 s |
+    | `?group=pct_all_time_max` | 0.44 s |
+    | 3 sort levels plus grouping | 0.47 s |
+  - Not yet run: `docker compose run --rm app python -m unittest`, `docker compose up -d --build`, and the browser check at desktop and phone width.
+- Must fix:
+  1. **The page grew from 2.7 MB to 7.44 MB.** About 42 % of it is whitespace. The `fmt` macro and the `{% for %}`/`{% if %}` tags print newlines and indentation in every cell, for example `<td class="text-end">\n  423.87\n  \n</td>`. Fix: use whitespace control (`{%- … -%}`) in the macro and the row loops, or set `app.jinja_env.trim_blocks = lstrip_blocks = True`. Then measure the size again.
+  2. **The sync summary appears twice.** The navbar badge shows it, and the old `alert alert-info` block under the navbar repeats it. The plan (§5.6) puts it only in the badge, with the details in its `title`. Remove the alert block.
+  3. **Level markers don't match §5.4.** With 2 or more levels, the primary column shows a bare `▲`/`▼` instead of `▲1`/`▼1`. Only a single-level sort should show the bare arrow.
+  4. **Some acceptance criteria have no test:**
+     - the level markers (`▼1`, `▲2`)
+     - the sort controls pre-filled from the URL
+     - header links that keep every sort level together with `status`, `q` and `country` (the route test only checks `group` and one `min_*` value)
+- Should fix:
+  5. Every `<th>` has `text-end`, but Ticker, Name, Exchange, Status and Updated are left-aligned in the body, so their headers sit in the wrong place. Right-align only the number columns.
+  6. The sticky header CSS is written twice: as a `th.sticky` rule and again inline on every `<th>`. Keep the CSS rule only.
+  7. `_query_rows` puts `op` from `bounds` into the SQL without checking it. Today only `index()` calls it, with `>=`/`<=`, but add `op in (">=", "<=")` next to the existing `key in DISTANCES` check for defence in depth (§6).
+  8. The template picks the distance columns with `key.startswith("pct_")` in 3 places. Pass `DISTANCES` (or its keys) to the template and loop over that, so all code reads from the one constant (§5.1).
+- Optional:
+  - The default `ticker` level stays on as level 2 after you click a header, so Ticker shows `▲2`. Ticker is already the final tie-breaker, so a trailing default `ticker` level could be dropped.
+  - `_query_rows` checks the sort levels again even though `_parse_sorts` already did. One check would be enough.
+  - The search input is full size, while the other controls use `-sm`.
+  - `navbar-light` is deprecated in Bootstrap 5.3 and has no effect next to `bg-body-tertiary`.
+- Security: no issues found.
+  - Sort columns, directions and distance keys come only from whitelists, and the bound values are `?` parameters.
+  - Autoescaping is kept, there is no `|safe`, and all links are built with `url_for`.
+  - The page has the pinned CSS with SRI and no `<script>` tag.
 #### Goal
 Section 1 above.
 #### Scope
@@ -138,15 +206,15 @@ Section 1 above.
 #### Reuse First
 The `_query_rows` way of building conditions, the `ALLOWED_SORTS` whitelist, the NULLs-last `ORDER BY`, the existing `columns` list, `EXCHANGE_COUNTRIES`, and the existing test fixtures (their price values already give known distances).
 #### Steps
-1. Add `DISTANCES`/`BUCKETS` and extend `ALLOWED_SORTS` and `columns`.
-2. Wrap the SELECT in the subquery and add the min/max conditions to `_query_rows(..., bounds=None)`, where `bounds` is a list of `(key, op, value)` with `op` either `>=` or `<=`.
-3. Add `_parse_sorts` and `_header_sorts`, and change `_query_rows` to take the sort list and build the multi-level `ORDER BY`.
-4. In `index()`: parse the bounds, `group` and the sort list, build `filters`, the header links and `groups`, and count the statuses.
-5. Rewrite the template (§5.6).
-6. Write the tests, then run them locally and in Docker.
-7. Repeat the timing check with 10.3k synthetic rows, both ungrouped and grouped.
-8. Check the page in a browser at desktop and phone width.
-9. Do the security check.
+1. Add `DISTANCES`/`BUCKETS` and extend `ALLOWED_SORTS` and `columns`. (Done)
+2. Wrap the SELECT in the subquery and add the min/max conditions to `_query_rows(..., bounds=None)`, where `bounds` is a list of `(key, op, value)` with `op` either `>=` or `<=`. (Done)
+3. Add `_parse_sorts` and `_header_sorts`, and change `_query_rows` to take the sort list and build the multi-level `ORDER BY`. (Done)
+4. In `index()`: parse the bounds, `group` and the sort list, build `filters`, the header links and `groups`, and count the statuses. (Done)
+5. Rewrite the template (§5.6). (Done)
+6. Write the tests, then run them locally and in Docker. (Done — 80/80 in both)
+7. Repeat the timing check with 10.3k synthetic rows, both ungrouped and grouped. (Done — 4.50 MB, under 0.41 s)
+8. Check the page in a browser at desktop and phone width. (Done — headless Chrome screenshots)
+9. Do the security check. (Done)
 #### Acceptance Criteria
 - Expected distances for the fixture AAPL (open 100, year 90–110, ATH 150, ATL 80): below Year High 9.1%, above Year Low 11.1%, below ATH 33.3%, above ATL 25.0%.
 - `?min_pct_all_time_max=30` includes AAPL. `?min_pct_all_time_max=34` excludes it.
@@ -184,5 +252,6 @@ See §6. Grep the diff for `|safe`, f-strings in SQL that contain request values
 - Current price = `opening_price`.
 
 ## 9. Open Decisions (user)
+0. Should a follow-up phase clean the impossible prices coming from yfinance (see the Phase 5 rework notes)?
 1. Are the ranges `<0 / 0–10 / 10–25 / 25–50 / 50–100 / ≥100 %` right, or do you want different ones?
 2. Should Bootstrap be bundled locally (served by Flask from `static/`) so the page is styled without internet? This would add one file and one Dockerfile `COPY`.

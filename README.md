@@ -11,6 +11,7 @@ docker compose up -d --build
 ```
 
 Open http://localhost:8000. Press **Sync Now** for the first sync (about an hour for all stocks); after that it runs every weekday at `SYNC_TIME_UTC`. Data is kept in the `data` Docker volume.
+The page shows each stock's distance from the year and all-time highs and lows in percent, with min/max filters on each distance, multi-column sorting (up to three columns), and optional grouping into percentage ranges.
 
 Tests: `docker compose run --rm app python -m unittest`
 

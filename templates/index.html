@@ -3,89 +3,191 @@
 <head>
 <meta charset="utf-8">
 <title>Trading 212 Stocks</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
 <style>
-  body { font-family: sans-serif; margin: 20px; }
-  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
-  th { background: #f4f4f4; cursor: pointer; }
-  tr:nth-child(even) { background: #fafafa; }
-  form { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
-  label { font-size: 0.9em; display: flex; align-items: center; gap: 4px; }
-  input[type="text"], select { padding: 6px; }
-  button { padding: 6px 12px; }
-  .summary { margin-bottom: 16px; font-size: 0.9em; color: #555; }
-  .error { color: #b00; }
+  th.sticky { position: sticky; top: 0; z-index: 1; background: #f8f9fa; }
+  .table-responsive { max-height: 75vh; }
 </style>
 </head>
-<body>
-<h1>Trading 212 Stocks</h1>
+<body class="container-fluid py-3">
+{% macro fmt(value, pct=False) -%}
+{% if value is none %}<span class="text-body-secondary">—</span>{% elif pct %}{{ "%.1f%%" % value }}{% else %}{{ "%.2f" % value }}{% endif %}
+{%- endmacro %}
 
-{% if running %}
-<div class="summary">Sync running…</div>
-{% endif %}
-{% if summary %}
-<div class="summary">
-  Last sync: {{ summary.started_at or "—" }} &rarr; {{ summary.finished_at or "—" }}
-  {% if summary.error %}
-    <span class="error">Error: {{ summary.error }}</span>
-  {% else %}
-    OK: {{ summary.ok }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}
-  {% endif %}
+<nav class="navbar navbar-expand-lg bg-body-tertiary mb-3 border-bottom">
+  <span class="navbar-brand">Trading 212 Stocks</span>
+  <div class="d-flex align-items-center">
+    {% if running %}
+      <span class="badge text-bg-warning me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Sync running…</span>
+    {% elif summary and summary.error %}
+      <span class="badge text-bg-danger me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Error: {{ summary.error }}</span>
+    {% elif summary %}
+      <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
+    {% endif %}
+    <form method="post" action="{{ url_for('sync_now') }}" class="d-inline">
+      <button type="submit" class="btn btn-primary btn-sm">Sync Now</button>
+    </form>
+  </div>
+</nav>
+
+<div class="row g-3 mb-3">
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Shown</div>
+      <div class="card-text fw-bold">{{ shown }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Active</div>
+      <div class="card-text fw-bold">{{ active }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">New this year</div>
+      <div class="card-text fw-bold">{{ new_count }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Delisted/Zero</div>
+      <div class="card-text fw-bold">{{ delisted }}</div>
+    </div></div>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <form method="get" action="{{ url_for('index') }}">
+      <div class="row g-2 align-items-end">
+        <div class="col-12 col-md-auto">
+          <label for="f-q" class="form-label small text-body-secondary mb-1">Search</label>
+          <input type="text" id="f-q" name="q" value="{{ q }}" class="form-control form-control-sm" placeholder="Ticker or name">
+        </div>
+        <div class="col-12 col-md-auto">
+          <label for="f-status" class="form-label small text-body-secondary mb-1">Status</label>
+          <select id="f-status" name="status" class="form-select form-select-sm">
+            <option value="" {% if not status %}selected{% endif %}>All</option>
+            <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
+            <option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>
+            <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
+          </select>
+        </div>
+        <div class="col-12 col-md-auto">
+          <label for="f-country" class="form-label small text-body-secondary mb-1">Country</label>
+          <select id="f-country" name="country" class="form-select form-select-sm">
+            <option value="" {% if not country %}selected{% endif %}>All</option>
+            {% for country_name in countries %}
+            <option value="{{ country_name }}" {% if country == country_name %}selected{% endif %}>{{ country_name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="row g-2 align-items-end mt-3 border-top pt-2">
+        <div class="col-12">
+          <label class="form-label small text-body-secondary">Distance from current price (%)</label>
+        </div>
+        {% for key, label in distance_labels.items() %}
+        <div class="col-12 col-md-auto">
+          <div class="input-group input-group-sm">
+            <span class="input-group-text">{{ label }}</span>
+            <input type="number" name="min_{{ key }}" value="{{ filters.get(('min_' ~ key), '') }}" class="form-control form-control-sm" step="any" placeholder="min">
+            <span class="input-group-text">–</span>
+            <input type="number" name="max_{{ key }}" value="{{ filters.get(('max_' ~ key), '') }}" class="form-control form-control-sm" step="any" placeholder="max">
+            <span class="input-group-text">%</span>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="row g-2 align-items-end mt-3 border-top pt-2">
+        {% for i in range(3) %}
+        {% set col = sorts[i][0] if i < sorts|length else '' %}
+        {% set d = sorts[i][1] if i < sorts|length else 'asc' %}
+        <div class="col-8 col-md-auto">
+          <label for="f-sort{{ i }}" class="form-label small text-body-secondary mb-1">{{ 'Sort by' if i == 0 else 'then by' }}</label>
+          <select id="f-sort{{ i }}" name="sort" class="form-select form-select-sm">
+            <option value="">—</option>
+            {% for c, l in columns %}
+            <option value="{{ c }}" {% if c == col %}selected{% endif %}>{{ l }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-4 col-md-auto">
+          <label for="f-dir{{ i }}" class="form-label small text-body-secondary mb-1">Order</label>
+          <select id="f-dir{{ i }}" name="dir" class="form-select form-select-sm">
+            <option value="asc" {% if d == 'asc' %}selected{% endif %}>Asc</option>
+            <option value="desc" {% if d == 'desc' %}selected{% endif %}>Desc</option>
+          </select>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="row g-2 align-items-end mt-3 border-top pt-2">
+        <div class="col-12 col-md-auto">
+          <label for="f-group" class="form-label small text-body-secondary mb-1">Group by</label>
+          <select id="f-group" name="group" class="form-select form-select-sm">
+            <option value="" {% if not group %}selected{% endif %}>None</option>
+            {% for key, label in distance_labels.items() %}
+            <option value="{{ key }}" {% if group == key %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-12 col-md-auto d-grid">
+          <button type="submit" class="btn btn-primary">Apply</button>
+        </div>
+        <div class="col-12 col-md-auto">
+          <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">Reset</a>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if group %}
+<div class="mb-2">
+  {% for label, g_rows in groups %}
+  <a href="#group-{{ loop.index0 }}" class="badge text-bg-secondary text-decoration-none">{{ label }} · {{ g_rows|length }}</a>
+  {% endfor %}
 </div>
 {% endif %}
 
-<form method="get" action="{{ url_for('index') }}">
-  <label>Status:
-    <select name="status">
-      <option value="" {% if not status %}selected{% endif %}>All</option>
-      <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
-      <option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>
-      <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
-    </select>
-  </label>
-  <label>Search:
-    <input type="text" name="q" value="{{ q }}">
-  </label>
-  <label>Country:
-    <select name="country">
-      <option value="" {% if not country %}selected{% endif %}>All</option>
-      {% for country_name in countries %}
-      <option value="{{ country_name }}" {% if country == country_name %}selected{% endif %}>{{ country_name }}</option>
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-sm table-striped table-hover align-middle text-nowrap mb-0">
+      <thead class="table-light">
+        <tr>
+        {% for col, label in columns %}
+        <th class="sticky{% if col in numeric_cols %} text-end{% endif %}">
+          <a href="{{ header_urls[col] }}" class="link-body-emphasis text-decoration-none">{{ label }}{% if col in sort_markers %} {{ sort_markers[col] }}{% endif %}</a>
+        </th>
+        {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for g_label, g_rows in groups %}
+      {% if g_label is not none %}
+      <tr>
+        <td colspan="{{ columns|length }}" class="table-secondary fw-bold" id="group-{{ loop.index0 }}">
+          {{ g_label }} · {{ g_rows|length }}
+        </td>
+      </tr>
+      {% endif %}
+      {% for row in g_rows %}
+      {% set st = row["status_tag"] %}
+{# Rows are written without indentation: ~10k rows make every byte count. #}
+<tr><td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td>
+{%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key]) }}</td>{% endfor -%}
+<td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>
+{%- for key in distance_labels %}<td class="text-end">{{ fmt(row[key], pct=True) }}</td>{% endfor %}</tr>
       {% endfor %}
-    </select>
-  </label>
-  <button type="submit">Filter</button>
-</form>
-<form method="post" action="{{ url_for('sync_now') }}" style="margin:0; display:inline;">
-  <button type="submit">Sync Now</button>
-</form>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 
-<table>
-  <thead>
-    <tr>
-      {% for col, label in columns %}
-      {% set active = (sort == col) %}
-      <th><a href="{{ url_for('index', sort=col, dir='desc' if active and direction == 'asc' else 'asc', status=status or none, q=q or none, country=country or none) }}">{{ label }}{% if active %} {% if direction == 'asc' %}▲{% else %}▼{% endif %}{% endif %}</a></th>
-      {% endfor %}
-    </tr>
-  </thead>
-  <tbody>
-    {% for row in rows %}
-    <tr>
-      <td>{{ row["ticker"] }}</td>
-      <td>{{ row["name"] or "—" }}</td>
-      <td>{{ row["exchange"] or "—" }}</td>
-      <td>{{ "%.2f" % row["opening_price"] if row["opening_price"] is not none else "—" }}</td>
-      <td>{{ "%.2f" % row["year_max"] if row["year_max"] is not none else "—" }}</td>
-      <td>{{ "%.2f" % row["year_min"] if row["year_min"] is not none else "—" }}</td>
-      <td>{{ "%.2f" % row["all_time_max"] if row["all_time_max"] is not none else "—" }}</td>
-      <td>{{ "%.2f" % row["all_time_min"] if row["all_time_min"] is not none else "—" }}</td>
-      <td>{{ row["status_tag"] }}</td>
-      <td>{{ row["last_updated"] or "—" }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-<p>{{ rows|length }} row(s) shown.</p>
+<p class="text-body-secondary">{{ shown }} row(s) shown.</p>
+
 </body>
 </html>
