@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for
 
 import sync
+import crypto_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -44,8 +45,14 @@ BUCKETS = [(None, 0), (0, 10), (10, 25), (25, 50), (50, 100), (100, None)]
 MAX_SORTS = 3
 
 DB_PATH = sync.DB_PATH
+CRYPTO_DB_PATH = os.environ.get("CRYPTO_DB_PATH", "crypto.db")
 
-columns = [
+CRYPTO_SYNC_TIME_UTC = os.environ.get("CRYPTO_SYNC_TIME_UTC", "02:00")
+CRYPTO_HH, CRYPTO_MM = (int(x) for x in CRYPTO_SYNC_TIME_UTC.split(":"))
+if not (0 <= CRYPTO_HH <= 23 and 0 <= CRYPTO_MM <= 59):
+    raise ValueError(f"CRYPTO_SYNC_TIME_UTC must be HH:MM, got {CRYPTO_SYNC_TIME_UTC!r}")
+
+STOCK_BASE_COLUMNS = [
     ("ticker", "Ticker"),
     ("name", "Name"),
     ("exchange", "Exchange"),
@@ -56,24 +63,76 @@ columns = [
     ("all_time_min", "All-Time Low"),
     ("status_tag", "Status"),
     ("last_updated", "Updated"),
-] + [(key, label) for key, (label, _expr) in DISTANCES.items()]
+]
+
+CRYPTO_BASE_COLUMNS = [
+    ("market_cap_rank", "Rank"),
+    ("symbol", "Symbol"),
+    ("name", "Name"),
+    ("opening_price", "Price"),
+    ("year_max", "Year High"),
+    ("year_min", "Year Low"),
+    ("all_time_max", "All-Time High"),
+    ("all_time_min", "All-Time Low"),
+    ("status_tag", "Status"),
+    ("last_updated", "Updated"),
+]
+
+MODES = {
+    "stocks": {
+        "table": "stocks",
+        "columns": STOCK_BASE_COLUMNS + [(key, label) for key, (label, _expr) in DISTANCES.items()],
+        "db_columns": [col for col, _ in STOCK_BASE_COLUMNS],
+        "search": ["ticker", "name"],
+        "default_sort": ("ticker", "asc"),
+        "sorts": {
+            "ticker", "name", "exchange", "opening_price", "year_max", "year_min",
+            "all_time_max", "all_time_min", "status_tag", "last_updated",
+        },
+    },
+    "crypto": {
+        "table": "crypto",
+        "columns": CRYPTO_BASE_COLUMNS + [(key, label) for key, (label, _expr) in DISTANCES.items()],
+        "db_columns": ["ticker"] + [col for col, _ in CRYPTO_BASE_COLUMNS],
+        # ticker is the CoinGecko id (e.g. "bitcoin"); people search by symbol ("btc").
+        "search": ["ticker", "symbol", "name"],
+        # Biggest coins first; unranked coins go last (ORDER BY puts NULLs last).
+        "default_sort": ("market_cap_rank", "asc"),
+        "sorts": {
+            "market_cap_rank", "symbol", "name", "opening_price", "year_max", "year_min",
+            "all_time_max", "all_time_min", "status_tag", "last_updated",
+        },
+    },
+}
+DEFAULT_MODE = "stocks"
+
+
+def mode_of(args):
+    mode = (args.get("mode") or "").strip()
+    return mode if mode in MODES else DEFAULT_MODE
+
 
 _sync_lock = threading.Lock()
+_crypto_lock = threading.Lock()
 last_summary = None
+last_crypto_summary = None
 
 
-def next_run(now=None, hh=SYNC_HH, mm=SYNC_MM):
-    """Return the next weekday at hh:mm UTC strictly after ``now``."""
+def next_run(now=None, hh=SYNC_HH, mm=SYNC_MM, weekdays_only=True):
+    """Return the next run at hh:mm UTC strictly after ``now``.
+
+    When ``weekdays_only`` is False the run fires every day (crypto trades 24/7).
+    """
     now = now or datetime.now(timezone.utc)
     candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    while candidate <= now or candidate.weekday() >= 5:
+    while candidate <= now or (weekdays_only and candidate.weekday() >= 5):
         candidate += timedelta(days=1)
         candidate = candidate.replace(hour=hh, minute=mm, second=0, microsecond=0)
     return candidate
 
 
 def run_sync_job():
-    """Run sync if the lock is free; otherwise skip (no concurrent syncs)."""
+    """Run the stock sync if the lock is free; otherwise skip (no concurrent syncs)."""
     global last_summary
     if not _sync_lock.acquire(blocking=False):
         return
@@ -85,47 +144,68 @@ def run_sync_job():
         _sync_lock.release()
 
 
-def _scheduler_loop():
+def run_crypto_sync_job():
+    """Run the crypto sync if the lock is free; otherwise skip (no concurrent syncs)."""
+    global last_crypto_summary
+    if not _crypto_lock.acquire(blocking=False):
+        return
+    try:
+        last_crypto_summary = crypto_sync.run_sync(db_path=CRYPTO_DB_PATH)
+    except Exception as exc:  # noqa: BLE001
+        last_crypto_summary = {"error": str(exc)}
+    finally:
+        _crypto_lock.release()
+
+
+def _scheduler_loop(get_next_run, run_job):
     while True:
-        nr = next_run(hh=SYNC_HH, mm=SYNC_MM)
+        nr = get_next_run()
         wait = (nr - datetime.now(timezone.utc)).total_seconds()
         if wait > 0:
             time.sleep(wait)
-        run_sync_job()
+        run_job()
 
 
-threading.Thread(target=_scheduler_loop, daemon=True).start()
+threading.Thread(target=_scheduler_loop, args=(
+    lambda: next_run(hh=SYNC_HH, mm=SYNC_MM),
+    run_sync_job,
+), daemon=True).start()
+threading.Thread(target=_scheduler_loop, args=(
+    lambda: next_run(hh=CRYPTO_HH, mm=CRYPTO_MM, weekdays_only=False),
+    run_crypto_sync_job,
+), daemon=True).start()
 
 
-def _query_rows(status=None, q=None, country=None, sorts=None, bounds=None):
+def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, sorts=None, bounds=None):
+    cfg = MODES[mode]
     if sorts is None:
-        sorts = [("ticker", "asc")]
+        sorts = [cfg["default_sort"]]
+    sorts_whitelist = cfg["sorts"] | set(DISTANCES)
     levels = []
     for col, direction in sorts:
-        if col not in ALLOWED_SORTS:
+        if col not in sorts_whitelist:
             continue
         if direction not in ("asc", "desc"):
             direction = "asc"
         levels.append((col, direction))
     if not levels:
-        levels = [("ticker", "asc")]
+        levels = [cfg["default_sort"]]
     order = ", ".join(f"{col} IS NULL, {col} {direction}" for col, direction in levels)
     order += ", ticker"
 
     dist_exprs = ", ".join(f"({expr}) AS {key}" for key, (_label, expr) in DISTANCES.items())
-    sql = (
-        f"SELECT * FROM (SELECT ticker, name, exchange, opening_price, year_max, year_min, "
-        f"all_time_max, all_time_min, status_tag, last_updated, {dist_exprs} FROM stocks)"
-    )
+    select_cols = ", ".join(cfg["db_columns"])
+    sql = f"SELECT * FROM (SELECT {select_cols}, {dist_exprs} FROM {cfg['table']})"
     params = []
     conditions = []
     if status and STATUS_PATTERN.match(status):
         conditions.append("status_tag = ?")
         params.append(status)
     if q:
-        conditions.append("(ticker LIKE ? OR name LIKE ?)")
-        params.extend([f"%{q}%", f"%{q}%"])
-    if country:
+        # Column names come from the fixed MODES config, never from the request.
+        conditions.append("(" + " OR ".join(f"{col} LIKE ?" for col in cfg["search"]) + ")")
+        params.extend([f"%{q}%"] * len(cfg["search"]))
+    if country and mode == "stocks":
         countries = sync.EXCHANGE_COUNTRIES
         exchanges = [ex for ex, c in countries.items() if c == country]
         if exchanges:
@@ -141,8 +221,12 @@ def _query_rows(status=None, q=None, country=None, sorts=None, bounds=None):
         sql += " WHERE " + " AND ".join(conditions)
     sql += f" ORDER BY {order}"
 
-    sync.init_db(DB_PATH)  # fresh DB: create the table before the first sync
-    conn = sqlite3.connect(DB_PATH)
+    db_path = CRYPTO_DB_PATH if mode == "crypto" else DB_PATH
+    if mode == "crypto":
+        crypto_sync.init_db(db_path)
+    else:
+        sync.init_db(db_path)
+    conn = sqlite3.connect(db_path)
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
@@ -162,13 +246,13 @@ def _parse_pct(value):
     return result if math.isfinite(result) else None
 
 
-def _parse_sorts(args):
+def _parse_sorts(args, sorts_whitelist=ALLOWED_SORTS, default=("ticker", "asc")):
     """Parse repeated sort/dir params into up to MAX_SORTS whitelisted (col, dir) levels."""
     sorts = []
     cols = args.getlist("sort")
     dirs = args.getlist("dir")
     for i, col in enumerate(cols):
-        if not col or col not in ALLOWED_SORTS:
+        if not col or col not in sorts_whitelist:
             continue
         if any(c == col for c, _ in sorts):
             continue
@@ -178,7 +262,7 @@ def _parse_sorts(args):
         sorts.append((col, direction))
         if len(sorts) >= MAX_SORTS:
             break
-    return sorts or [("ticker", "asc")]
+    return sorts or [default]
 
 
 def _header_sorts(sorts, col):
@@ -234,13 +318,17 @@ def _group_rows(rows, key):
 
 @app.get("/")
 def index():
+    mode = mode_of(request.args)
+    cfg = MODES[mode]
+    columns = cfg["columns"]
+    sorts_whitelist = cfg["sorts"] | set(DISTANCES)
     status = request.args.get("status", "").strip() or None
     q = request.args.get("q", "").strip() or None
-    country = request.args.get("country", "").strip() or None
+    country = None if mode == "crypto" else (request.args.get("country", "").strip() or None)
     group = request.args.get("group", "").strip()
     if group not in DISTANCES:
         group = None
-    sorts = _parse_sorts(request.args)
+    sorts = _parse_sorts(request.args, sorts_whitelist, cfg["default_sort"])
     bounds = []
     filters = {}
     if status:
@@ -257,7 +345,9 @@ def index():
             if value is not None:
                 bounds.append((key, ">=" if bound == "min" else "<=", value))
                 filters[f"{bound}_{key}"] = f"{value:g}"
-    rows = _query_rows(status=status, q=q, country=country, sorts=sorts, bounds=bounds)
+    filters["mode"] = mode
+    nav_filters = {k: v for k, v in filters.items() if k != "mode"}
+    rows = _query_rows(mode=mode, status=status, q=q, country=country, sorts=sorts, bounds=bounds)
     groups = _group_rows(rows, group)
     counts = collections.Counter(r["status_tag"] for r in rows)
     sort_markers = {}
@@ -272,6 +362,12 @@ def index():
             "index", sort=[c for c, _ in hs], dir=[d for _, d in hs], **filters
         )
     new_tag = f"NEW_{datetime.now().year}"
+    if mode == "crypto":
+        running = _crypto_lock.locked()
+        summary = last_crypto_summary
+    else:
+        running = _sync_lock.locked()
+        summary = last_summary
     return render_template(
         "index.html",
         groups=groups,
@@ -280,13 +376,15 @@ def index():
         q=q or "",
         country=country or "",
         filters=filters,
+        nav_filters=nav_filters,
         columns=columns,
         distance_labels={key: label for key, (label, _expr) in DISTANCES.items()},
         numeric_cols={"opening_price", "year_max", "year_min", "all_time_max", "all_time_min", *DISTANCES},
         countries=sorted(sync.EXCHANGE_COUNTRIES.values()),
-        summary=last_summary,
-        running=_sync_lock.locked(),
+        summary=summary,
+        running=running,
         new_tag=new_tag,
+        mode=mode,
         sorts=sorts,
         sort_markers=sort_markers,
         header_urls=header_urls,
@@ -307,3 +405,10 @@ def sync_now():
     # A full sync takes hours, so run it in the background; run_sync_job skips if one is running.
     threading.Thread(target=run_sync_job, daemon=True).start()
     return redirect(url_for("index"))
+
+
+@app.post("/sync/crypto")
+def sync_crypto_now():
+    # A crypto sync takes minutes, so run it in the background; run_crypto_sync_job skips if one is running.
+    threading.Thread(target=run_crypto_sync_job, daemon=True).start()
+    return redirect(url_for("index", mode="crypto"))

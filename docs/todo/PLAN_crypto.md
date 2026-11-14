@@ -178,7 +178,15 @@ The test command from §3, then the live scratch-DB run: `docker run` with `--us
 - Grep the diff for the key's prefix `CG-` and for `print(`.
 
 ### Phase 2: Dashboard crypto mode and scheduling
-**Status:** Not Started
+**Status:** Done — Passed Review
+
+**Implementation notes (2026-11-14 rework after Review Failed):**
+- Each entry in `MODES` now lists its search columns and default sort. Crypto search covers `ticker` (the CoinGecko id), `symbol` and `name`, so searching "btc" finds Bitcoin first. The column names come only from `MODES`.
+- Crypto defaults to sorting by `market_cap_rank` ascending, with unranked coins last. Stocks still default to `ticker`.
+- The "New this year" status option is hidden in crypto mode. The search placeholder reads "Symbol or name" there.
+- `README.md` has a Crypto section covering the source, the key, the schedule, the yearly high/low and the attribution.
+- Checked on the 18,230-coin scratch DB: "btc" returns Bitcoin as the first row, the default order starts BTC, ETH, USDT, BNB, USDC, and unranked coins come last.
+- Second rework (after the second review): the README now gives the CoinGecko usage per run (about 275) and per month (about 8,250 at one run a day). The search box's screen-reader label follows the mode ("Search symbol or name" / "Search ticker or name"), covered by `test_search_label_follows_mode`.
 **Depends on:** Phase 1
 
 #### Goal
