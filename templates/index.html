@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Trading 212 Stocks</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+<style>
+  thead { position: sticky; top: 0; z-index: 2; }
+  thead th { background: #f8f9fa; }
+  .table-responsive { max-height: 75vh; }
+  tr.filters th { font-weight: normal; padding-top: 0; }
+  tr.filters .form-control, tr.filters .form-select { font-size: .8rem; padding: .1rem .35rem; }
+  tr.filters .form-select { padding-right: 1.5rem; }
+  tr.filters input.pct { width: 4rem; text-align: right; }
+  tr.filters select[name="country"] { min-width: 9.5rem; }
+  tr.filters .active-filter { border-color: var(--bs-primary); background: var(--bs-primary-bg-subtle); }
+</style>
+</head>
+<body class="container-fluid py-3">
+{% macro fmt(value, pct=False) -%}
+{% if value is none %}<span class="text-body-secondary">—</span>{% elif pct %}{{ "%.1f%%" % value }}{% else %}{{ "%.2f" % value }}{% endif %}
+{%- endmacro %}
+
+<nav class="navbar navbar-expand-lg bg-body-tertiary mb-3 border-bottom">
+  <span class="navbar-brand">Trading 212 Stocks</span>
+  <div class="d-flex align-items-center">
+    {% if running %}
+      <span class="badge text-bg-warning me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Sync running…</span>
+    {% elif summary and summary.error %}
+      <span class="badge text-bg-danger me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Error: {{ summary.error }}</span>
+    {% elif summary %}
+      <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, No data: {{ summary.no_data }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
+    {% endif %}
+    <form method="post" action="{{ url_for('sync_now') }}" class="d-inline">
+      <button type="submit" class="btn btn-primary btn-sm">Sync Now</button>
+    </form>
+  </div>
+</nav>
+
+<div class="row g-3 mb-3">
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Shown</div>
+      <div class="card-text fw-bold">{{ shown }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Active</div>
+      <div class="card-text fw-bold">{{ active }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">New this year</div>
+      <div class="card-text fw-bold">{{ new_count }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="card-title small text-body-secondary">Delisted/Zero</div>
+      <div class="card-text fw-bold">{{ delisted }}</div>
+    </div></div>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <form method="get" action="{{ url_for('index') }}" id="filters">
+      <p class="small text-body-secondary mb-2">Filter in the row under the column headers, then press Enter or Apply. Percent ranges include both ends (min ≤ x ≤ max).</p>
+      <div class="row g-2 align-items-end">
+        {% for i in range(3) %}
+        {% set col = sorts[i][0] if i < sorts|length else '' %}
+        {% set d = sorts[i][1] if i < sorts|length else 'asc' %}
+        <div class="col-8 col-md-auto">
+          <label for="f-sort{{ i }}" class="form-label small text-body-secondary mb-1">{{ 'Sort by' if i == 0 else 'then by' }}</label>
+          <select id="f-sort{{ i }}" name="sort" class="form-select form-select-sm">
+            <option value="">—</option>
+            {% for c, l in columns %}
+            <option value="{{ c }}" {% if c == col %}selected{% endif %}>{{ l }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-4 col-md-auto">
+          <label for="f-dir{{ i }}" class="form-label small text-body-secondary mb-1">Order</label>
+          <select id="f-dir{{ i }}" name="dir" class="form-select form-select-sm">
+            <option value="asc" {% if d == 'asc' %}selected{% endif %}>Asc</option>
+            <option value="desc" {% if d == 'desc' %}selected{% endif %}>Desc</option>
+          </select>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="row g-2 align-items-end mt-3 border-top pt-2">
+        <div class="col-12 col-md-auto">
+          <label for="f-group" class="form-label small text-body-secondary mb-1">Group by</label>
+          <select id="f-group" name="group" class="form-select form-select-sm">
+            <option value="" {% if not group %}selected{% endif %}>None</option>
+            {% for key, label in distance_labels.items() %}
+            <option value="{{ key }}" {% if group == key %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-12 col-md-auto d-grid">
+          <button type="submit" class="btn btn-primary">Apply</button>
+        </div>
+        <div class="col-12 col-md-auto">
+          <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">Reset</a>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if group %}
+<div class="mb-2">
+  {% for label, g_rows in groups %}
+  <a href="#group-{{ loop.index0 }}" class="badge text-bg-secondary text-decoration-none">{{ label }} · {{ g_rows|length }}</a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-sm table-striped table-hover align-middle text-nowrap mb-0">
+      <thead class="table-light">
+        <tr>
+        {% for col, label in columns %}
+        <th{% if col in numeric_cols %} class="text-end"{% endif %}>
+          <a href="{{ header_urls[col] }}" class="link-body-emphasis text-decoration-none">{{ label }}{% if col in sort_markers %} {{ sort_markers[col] }}{% endif %}</a>
+        </th>
+        {% endfor %}
+        </tr>
+        <tr class="filters">
+          <th colspan="2">
+            <input type="search" name="q" form="filters" value="{{ q }}" placeholder="Ticker or name" aria-label="Search ticker or name"
+                   class="form-control form-control-sm{% if q %} active-filter{% endif %}">
+          </th>
+          <th>
+            <select name="country" form="filters" aria-label="Country" class="form-select form-select-sm{% if country %} active-filter{% endif %}">
+              <option value="" {% if not country %}selected{% endif %}>All countries</option>
+              {% for country_name in countries %}
+              <option value="{{ country_name }}" {% if country == country_name %}selected{% endif %}>{{ country_name }}</option>
+              {% endfor %}
+            </select>
+          </th>
+          <th colspan="5"></th>
+          <th>
+            <select name="status" form="filters" aria-label="Status" class="form-select form-select-sm{% if status %} active-filter{% endif %}">
+              <option value="" {% if not status %}selected{% endif %}>All</option>
+              <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
+              <option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>
+              <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
+            </select>
+          </th>
+          <th>
+            <button type="submit" form="filters" class="btn btn-primary btn-sm py-0">Apply</button>
+            <a href="{{ url_for('index') }}" class="btn btn-outline-secondary btn-sm py-0">Reset</a>
+          </th>
+          {% for key, label in distance_labels.items() %}
+          {% set lo = filters.get('min_' ~ key, '') %}{% set hi = filters.get('max_' ~ key, '') %}
+          <th class="text-end">
+            <div class="d-inline-flex align-items-center gap-1">
+              <input type="number" name="min_{{ key }}" form="filters" value="{{ lo }}" step="any" placeholder="min" aria-label="{{ label }} minimum %"
+                     class="form-control form-control-sm pct{% if lo %} active-filter{% endif %}">
+              <span class="text-body-secondary">–</span>
+              <input type="number" name="max_{{ key }}" form="filters" value="{{ hi }}" step="any" placeholder="max" aria-label="{{ label }} maximum %"
+                     class="form-control form-control-sm pct{% if hi %} active-filter{% endif %}">
+            </div>
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for g_label, g_rows in groups %}
+      {% if g_label is not none %}
+      <tr>
+        <td colspan="{{ columns|length }}" class="table-secondary fw-bold" id="group-{{ loop.index0 }}">
+          {{ g_label }} · {{ g_rows|length }}
+        </td>
+      </tr>
+      {% endif %}
+      {% for row in g_rows %}
+      {% set st = row["status_tag"] %}
+{# Rows are written without indentation: ~10k rows make every byte count. #}
+<tr><td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td>
+{%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key]) }}</td>{% endfor -%}
+<td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>
+{%- for key in distance_labels %}<td class="text-end">{{ fmt(row[key], pct=True) }}</td>{% endfor %}</tr>
+      {% endfor %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<p class="text-body-secondary">{{ shown }} row(s) shown.</p>
+
+</body>
+</html>
