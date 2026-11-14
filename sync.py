@@ -1,10 +1,18 @@
+import logging
 import os
 import sqlite3
+import time
+import warnings
 from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
+
+log = logging.getLogger(__name__)
+# yfinance calls deprecated pandas inplace APIs on every download; keep that out of the logs.
+warnings.filterwarnings("ignore", message="The inplace keyword", module="yfinance")
 
 DB_PATH = os.environ.get("DB_PATH", "trading212_stocks.db")
 
@@ -15,7 +23,17 @@ T212_BASE_URLS = {
 }
 INSTRUMENTS_ENDPOINT = "/equity/metadata/instruments"
 REQUEST_TIMEOUT = 30
-BATCH_SIZE = 50
+
+# Yahoo pacing: one request per ticker, a pause between them, and an exponential back-off
+# whenever Yahoo answers 429. Rate limits never count as a failure; the ticker is retried.
+REQUEST_DELAY = float(os.environ.get("YAHOO_REQUEST_DELAY", "0.5"))
+RATE_LIMIT_BACKOFF = 60
+MAX_RATE_LIMIT_BACKOFF = 15 * 60
+# Other errors (timeouts, connection resets): attempts per ticker per pass, and extra passes
+# over the tickers that still failed, each after a pause.
+MAX_ATTEMPTS = 3
+RETRY_PASSES = 3
+RETRY_PASS_PAUSE = 5 * 60
 
 # T212 ticker endings -> (Yahoo suffix, exchange), derived from the real instruments list.
 # "<SYMBOL>_<country>_EQ", e.g. "AAPL_US_EQ":
@@ -99,7 +117,8 @@ def to_yahoo(ticker: str) -> tuple[str, str] | None:
 
     Returns None for non-equity, malformed or unmapped tickers.
     """
-    parts = ticker.split("_")
+    # Yahoo writes share classes with a dash: T212 "BRK/A_US_EQ" is Yahoo "BRK-A".
+    parts = ticker.replace("/", "-").split("_")
     if len(parts) == 3 and parts[0] and parts[1] in COUNTRY_CODES and parts[2] == "EQ":
         suffix, exchange = COUNTRY_CODES[parts[1]]
         return parts[0] + suffix, exchange
@@ -151,10 +170,80 @@ def compute_metrics(hist: pd.DataFrame, year: int) -> dict:
     }
 
 
+class _Yahoo:
+    """Fetches price history one ticker at a time, respecting Yahoo's rate limit."""
+
+    def __init__(self):
+        # Let yfinance raise instead of logging and returning an empty frame, so a network
+        # error is never mistaken for "this ticker has no data".
+        yf.config.debug.hide_exceptions = False
+        self.backoff = RATE_LIMIT_BACKOFF
+
+    def history(self, yahoo: str) -> pd.DataFrame | None:
+        """Return the full history, or None if Yahoo has no data for the symbol.
+
+        Raises the last error if the symbol still fails after MAX_ATTEMPTS.
+        """
+        attempts = 0
+        while True:
+            time.sleep(REQUEST_DELAY)
+            try:
+                hist = yf.Ticker(yahoo).history(period="max", actions=False)
+            except YFRateLimitError:
+                log.warning("Yahoo rate limit hit; waiting %ds before retrying %s", self.backoff, yahoo)
+                time.sleep(self.backoff)
+                self.backoff = min(self.backoff * 2, MAX_RATE_LIMIT_BACKOFF)
+                continue
+            except YFTickerMissingError:
+                return None
+            except Exception:
+                attempts += 1
+                if attempts >= MAX_ATTEMPTS:
+                    raise
+                time.sleep(2 ** attempts)
+                continue
+            self.backoff = RATE_LIMIT_BACKOFF
+            hist = hist.dropna(how="all")
+            return None if hist.empty else hist
+
+
+def _upsert(cursor, inst: dict, exchange: str, metrics: dict) -> None:
+    cursor.execute(
+        """
+        INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min,
+                            all_time_max, all_time_min, status_tag, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(ticker) DO UPDATE SET
+            name=excluded.name,
+            exchange=excluded.exchange,
+            opening_price=excluded.opening_price,
+            year_max=excluded.year_max,
+            year_min=excluded.year_min,
+            all_time_max=excluded.all_time_max,
+            all_time_min=excluded.all_time_min,
+            status_tag=excluded.status_tag,
+            last_updated=datetime('now')
+        """,
+        (
+            inst["ticker"],
+            inst.get("name"),
+            exchange,
+            metrics["opening_price"],
+            metrics["year_max"],
+            metrics["year_min"],
+            metrics["all_time_max"],
+            metrics["all_time_min"],
+            metrics["status_tag"],
+        ),
+    )
+
+
 def run_sync(db_path: str = DB_PATH) -> dict:
     """Fetch T212 instruments, map to Yahoo, download metrics, upsert into SQLite.
 
-    Returns a summary dict with ok, failed, unmapped counts and timestamps.
+    Returns a summary dict with counts and timestamps: ok, no_data (Yahoo has no prices for
+    the symbol), failed (still erroring after every retry pass, listed in failed_tickers)
+    and unmapped (no Yahoo symbol).
     """
     init_db(db_path)
     instruments = fetch_instruments()
@@ -173,77 +262,47 @@ def run_sync(db_path: str = DB_PATH) -> dict:
 
     summary = {
         "ok": 0,
+        "no_data": 0,
         "failed": 0,
         "unmapped": unmapped_count,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    yahoo_tickers = list(yahoo_map.keys())
+    yahoo = _Yahoo()
+    pending = list(yahoo_map.keys())
     conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
         current_year = datetime.now().year
 
-        for i in range(0, len(yahoo_tickers), BATCH_SIZE):
-            batch = yahoo_tickers[i : i + BATCH_SIZE]
-            try:
-                raw = yf.download(
-                    batch, period="max", group_by="ticker", progress=False, threads=False
-                )
-            except Exception:
-                raw = None
-
-            for yahoo in batch:
-                inst, exchange = yahoo_map[yahoo]
+        for sync_pass in range(RETRY_PASSES + 1):
+            if sync_pass:
+                log.info("Retry pass %d: %d tickers, after %ds", sync_pass, len(pending), RETRY_PASS_PAUSE)
+                time.sleep(RETRY_PASS_PAUSE)
+            errored = []
+            for n, symbol in enumerate(pending, 1):
+                inst, exchange = yahoo_map[symbol]
                 try:
-                    hist = None
-                    if raw is not None:
-                        try:
-                            hist = raw[yahoo]
-                        except (KeyError, TypeError):
-                            hist = raw if len(batch) == 1 else None
-                    # Batches pad invalid symbols and other exchanges' trading days with NaN rows.
-                    if hist is not None:
-                        hist = hist.dropna(how="all")
-                    if hist is None or hist.empty:
-                        summary["failed"] += 1
+                    hist = yahoo.history(symbol)
+                    if hist is None:
+                        summary["no_data"] += 1
                         continue
-
-                    metrics = compute_metrics(hist, current_year)
-                    cursor.execute(
-                        """
-                        INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min,
-                                            all_time_max, all_time_min, status_tag, last_updated)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                        ON CONFLICT(ticker) DO UPDATE SET
-                            name=excluded.name,
-                            exchange=excluded.exchange,
-                            opening_price=excluded.opening_price,
-                            year_max=excluded.year_max,
-                            year_min=excluded.year_min,
-                            all_time_max=excluded.all_time_max,
-                            all_time_min=excluded.all_time_min,
-                            status_tag=excluded.status_tag,
-                            last_updated=datetime('now')
-                        """,
-                        (
-                            inst["ticker"],
-                            inst.get("name"),
-                            exchange,
-                            metrics["opening_price"],
-                            metrics["year_max"],
-                            metrics["year_min"],
-                            metrics["all_time_max"],
-                            metrics["all_time_min"],
-                            metrics["status_tag"],
-                        ),
-                    )
+                    _upsert(cursor, inst, exchange, compute_metrics(hist, current_year))
                     summary["ok"] += 1
-                except Exception:
-                    summary["failed"] += 1
+                except Exception as exc:
+                    log.warning("%s failed: %r", symbol, exc)
+                    errored.append(symbol)
+                if n % 100 == 0:
+                    conn.commit()
+                    log.info("Sync pass %d: %d/%d done", sync_pass, n, len(pending))
             conn.commit()
+            pending = errored
+            if not pending:
+                break
     finally:
         conn.close()
 
+    summary["failed"] = len(pending)
+    summary["failed_tickers"] = [yahoo_map[s][0]["ticker"] for s in pending]
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
     return summary

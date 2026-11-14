@@ -169,12 +169,12 @@ class TestAppRoutes(unittest.TestCase):
 
     def test_summary_shown(self):
         app_module.last_summary = {
-            "ok": 7, "failed": 2, "unmapped": 3,
+            "ok": 7, "no_data": 4, "failed": 2, "unmapped": 3,
             "started_at": "2026-11-13T14:45:00", "finished_at": "2026-11-13T16:00:00",
         }
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn("2026-11-13T16:00:00", html)
-        self.assertEqual(html.count("OK: 7, Failed: 2, Unmapped: 3"), 1)
+        self.assertEqual(html.count("OK: 7, No data: 4, Failed: 2, Unmapped: 3"), 1)
 
     def test_get_sync_returns_405(self):
         resp = self.client.get("/sync")

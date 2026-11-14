@@ -1,6 +1,6 @@
 # Trading 212 Stock Database
 
-Tracks every stock tradable on Trading 212: daily opening price, yearly and all-time highs and lows, and flags new listings (`NEW_<year>`) and delisted stocks (`DELISTED_OR_ZERO`). Syncs automatically every weekday and shows the data on a small web page.
+Tracks every stock tradable: daily opening price, yearly and all-time highs and lows, and flags new listings (`NEW_<year>`) and delisted stocks (`DELISTED_OR_ZERO`). Syncs automatically every weekday and shows the data on a small web page.
 
 ## Run
 

@@ -1,4 +1,5 @@
 import collections
+import logging
 import math
 import os
 import re
@@ -10,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for
 
 import sync
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = Flask(__name__)
 # The table renders ~10k rows; drop template indentation and newlines from the output.
