@@ -2,7 +2,8 @@ FROM python:3.13.15-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/trading212_stocks.db
+    DB_PATH=/data/trading212_stocks.db \
+    CRYPTO_DB_PATH=/data/crypto.db
 
 WORKDIR /app
 
@@ -14,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --system --uid 10001 --no-create-home app \
     && mkdir /data && chown app:app /data
 
-COPY sync.py app.py ./
+COPY sync.py app.py crypto_sync.py ./
 COPY templates/ templates/
 COPY tests/ tests/
 
