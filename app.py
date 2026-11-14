@@ -22,7 +22,6 @@ ALLOWED_SORTS = {
     "ticker", "name", "exchange", "opening_price", "year_max", "year_min",
     "all_time_max", "all_time_min", "status_tag", "last_updated",
 }
-ROW_CAP = 500
 DB_PATH = sync.DB_PATH
 
 _sync_lock = threading.Lock()
@@ -64,7 +63,7 @@ def _scheduler_loop():
 threading.Thread(target=_scheduler_loop, daemon=True).start()
 
 
-def _query_rows(status=None, q=None, sort="ticker", direction="asc"):
+def _query_rows(status=None, q=None, country=None, sort="ticker", direction="asc"):
     if sort not in ALLOWED_SORTS:
         sort = "ticker"
     if direction not in ("asc", "desc"):
@@ -82,10 +81,17 @@ def _query_rows(status=None, q=None, sort="ticker", direction="asc"):
     if q:
         conditions.append("(ticker LIKE ? OR name LIKE ?)")
         params.extend([f"%{q}%", f"%{q}%"])
+    if country:
+        countries = sync.EXCHANGE_COUNTRIES
+        exchanges = [ex for ex, c in countries.items() if c == country]
+        if exchanges:
+            placeholders = ", ".join("?" for _ in exchanges)
+            conditions.append(f"exchange IN ({placeholders})")
+            params.extend(exchanges)
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
-    sql += f" ORDER BY {sort} {direction} LIMIT ?"
-    params.append(ROW_CAP)
+    # NULLs always last, then by the sort column, then ticker for stability.
+    sql += f" ORDER BY {sort} IS NULL, {sort} {direction}, ticker"
 
     sync.init_db(DB_PATH)  # fresh DB: create the table before the first sync
     conn = sqlite3.connect(DB_PATH)
@@ -101,21 +107,40 @@ def _query_rows(status=None, q=None, sort="ticker", direction="asc"):
 def index():
     status = request.args.get("status", "").strip() or None
     q = request.args.get("q", "").strip() or None
+    country = request.args.get("country", "").strip() or None
     sort = request.args.get("sort", "ticker").strip()
     direction = request.args.get("dir", "asc").strip()
-    rows = _query_rows(status=status, q=q, sort=sort, direction=direction)
+    rows = _query_rows(status=status, q=q, country=country, sort=sort, direction=direction)
     return render_template(
         "index.html",
         rows=rows,
         status=status or "",
         q=q or "",
+        country=country or "",
         sort=sort,
         direction=direction,
+        columns=[
+            ("ticker", "Ticker"),
+            ("name", "Name"),
+            ("exchange", "Exchange"),
+            ("opening_price", "Open"),
+            ("year_max", "Year High"),
+            ("year_min", "Year Low"),
+            ("all_time_max", "All-Time High"),
+            ("all_time_min", "All-Time Low"),
+            ("status_tag", "Status"),
+            ("last_updated", "Updated"),
+        ],
+        countries=sorted(sync.EXCHANGE_COUNTRIES.values()),
         summary=last_summary,
         running=_sync_lock.locked(),
         new_tag=f"NEW_{datetime.now().year}",
-        row_cap=ROW_CAP,
     )
+
+
+@app.get("/health")
+def health():
+    return "ok", 200
 
 
 @app.post("/sync")

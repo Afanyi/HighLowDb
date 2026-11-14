@@ -263,5 +263,20 @@ class TestRunSync(unittest.TestCase):
         self.assertEqual(opening, 150.0)
 
 
+class TestExchangeCountries(unittest.TestCase):
+    def test_every_country_code_exchange_has_a_country(self):
+        for code, (_suffix, exchange) in sync.COUNTRY_CODES.items():
+            self.assertIn(exchange, sync.EXCHANGE_COUNTRIES)
+
+    def test_every_letter_exchange_has_a_country(self):
+        for letter, (_suffix, exchange) in sync.EXCHANGE_LETTERS.items():
+            self.assertIn(exchange, sync.EXCHANGE_COUNTRIES)
+
+    def test_countries_non_empty(self):
+        for exchange, country in sync.EXCHANGE_COUNTRIES.items():
+            self.assertTrue(exchange)
+            self.assertTrue(country)
+
+
 if __name__ == "__main__":
     unittest.main()

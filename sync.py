@@ -38,6 +38,21 @@ EXCHANGE_LETTERS = {
     "a": (".AS", "AMSTERDAM"),
 }
 
+# Exchange label -> country, for the UI country filter.
+EXCHANGE_COUNTRIES = {
+    "US": "United States",
+    "TSX": "Canada",
+    "LISBON": "Portugal",
+    "VIENNA": "Austria",
+    "BRUSSELS": "Belgium",
+    "LSE": "United Kingdom",
+    "FRANKFURT": "Germany",
+    "PARIS": "France",
+    "MADRID": "Spain",
+    "SIX": "Switzerland",
+    "AMSTERDAM": "Netherlands",
+}
+
 
 def init_db(db_path: str = DB_PATH) -> None:
     conn = sqlite3.connect(db_path)

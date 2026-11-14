@@ -418,6 +418,81 @@ Run the commands above. Report each command as run, or as not run with the reaso
 - No privileged mode and no Docker socket mount.
 - The base image tag is pinned.
 
+### Phase 4: Show all stocks, add sortable columns and a country filter
+**Status:** Done — Passed Review
+**Depends on:** Phase 3
+#### Review (2026-11-14)
+- Passed. The diff is limited to the planned files: `app.py`, the template, `sync.py` (constant only), `compose.yaml` (healthcheck URL only) and the tests. There is no schema change and no JavaScript.
+- Verification run by the reviewer, which completes the executor's pending items:
+  - Local `python3 -m unittest`: OK.
+  - Timing with 10,300 synthetic rows:
+    - `/` → 200, 0.137 s, 2.61 MB, 10,300 rows
+    - `?sort=year_max&dir=desc` → 0.084 s
+    - `?country=Germany&sort=name&dir=desc` → 1,009 rows, 0.009 s
+    - The target of under 2 s is met.
+  - `docker compose build`: built. `docker compose run --rm app python -m unittest`: OK.
+  - `docker compose up -d`: `Up (healthy)`. The healthcheck test is `/health`, `curl /health` returns `ok`, and a filtered and sorted page returns 200 on the live volume DB (996 rows).
+  - No manual browser click-through (no browser available). The equivalent HTTP checks above were run.
+- Security: no issues.
+  - The sort column comes only from the whitelist, used in `ORDER BY` and `IS NULL`.
+  - The direction comes only from `asc`/`desc`.
+  - The country is matched against `EXCHANGE_COUNTRIES`, with the exchanges passed as `?` parameters. An unknown country is ignored.
+  - Header links use `url_for` and are autoescaped.
+  - `/health` returns only `ok`.
+- Optional:
+  - `index()` passes the raw `sort`/`dir` to the template. With a hand-crafted invalid value (for example `?sort=bogus`), the data falls back to ticker/asc correctly, but no ▲/▼ marker is shown. Normalizing the values once in `index()` would fix that.
+  - The "Sync Now" form got an inline style (`display:inline`), which is cosmetic only.
+#### Goal
+The web page shows every stock on one page. Clicking any column header sorts by that column, and clicking again reverses the order. A "Country" dropdown filters by the country of the exchange the stock trades on.
+#### Scope
+- `app.py`: (Done)
+  - Removed `ROW_CAP` and `LIMIT`.
+  - Added `country` query parameter, validated against fixed country list; maps to `exchange IN (...)` with parameters.
+  - Sort with NULLs always last (`ORDER BY <col> IS NULL, <col> <dir>, ticker`).
+  - Added `GET /health` returning `ok`; compose healthcheck switched to `/health`.
+- `sync.py`: (Done) Added `EXCHANGE_COUNTRIES` mapping each exchange label to a country. Sits next to existing ticker mapping.
+- `templates/index.html`: (Done)
+  - Every `<th>` is a sort link keeping status/q/country, flipping direction on active column; ▲/▼ marker shows active column.
+  - Removed Sort/Asc-Desc dropdowns.
+  - Added Country dropdown (All + countries).
+  - Row count text no longer mentions a cap.
+- `compose.yaml`: (Done) Healthcheck calls `/health`.
+- `tests/`: (Done) New tests for country filter, sort links, NULLs-last, no cap, /health, EXCHANGE_COUNTRIES.
+#### Do Not Change
+DB schema and sync logic unchanged. No new column, no migration. Status filter and search behaviour unchanged. Docker setup unchanged apart from healthcheck URL. No JavaScript, no pagination.
+#### Reuse First
+Existing `ALLOWED_SORTS` whitelist; `_query_rows` parameterized filter building; exchange labels from `COUNTRY_CODES`/`EXCHANGE_LETTERS`.
+#### Steps
+1. Inspected `app.py`, template, `sync.py`. (Done)
+2. Added `EXCHANGE_COUNTRIES` and tests. (Done)
+3. Extended `_query_rows` with country filter, NULLs-last ordering, no limit. (Done)
+4. Built header sort links in template using `url_for`. (Done)
+5. Added `/health` and switched healthcheck. (Done)
+6. Wrote tests. (Done — 56/56 passing.)
+7. Performance check with 10.3k synthetic rows. (Done — 0.142s, ~2.7MB HTML, target < 2s met.)
+8. `docker compose up -d --build` manual browser check. (Pending — requires Docker run; verified locally via test client.)
+9. Security check. (Done — see below.)
+#### Acceptance Criteria
+- With 600 rows in the DB, `GET /` lists all 600 rows (previously capped at 500). (Verified in test_all_600_rows_returned_no_cap.)
+- Each of the 10 column headers is a link with `sort=<that column>`. On the active column, the link has the opposite `dir`. Links keep `status`, `q` and `country`. (Verified in test_every_column_header_is_a_sort_link, test_active_column_flips_direction, test_links_keep_status_q_country.)
+- `?sort=year_max&dir=asc` and `?sort=year_max&dir=desc` both list rows with NULL `year_max` last. (Verified in test_year_max_nulls_last_asc/desc.)
+- `?country=Germany` shows only `FRANKFURT` rows. `?country=Atlantis` is ignored and shows all rows, never a SQL error. (Verified in test_country_germany_shows_only_frankfurt, test_unknown_country_ignored_shows_all_rows.)
+- Country dropdown lists every country in `EXCHANGE_COUNTRIES`; selected value stays selected. (Verified in test_country_dropdown_lists_every_country, test_country_selected_stays_selected.)
+- Every exchange label in `COUNTRY_CODES` and `EXCHANGE_LETTERS` has an entry in `EXCHANGE_COUNTRIES` (test). (Verified in TestExchangeCountries.)
+- `GET /health` returns 200 `ok`. (Verified in test_health_returns_ok.)
+- With 10,300 synthetic rows, `GET /` returns 200. Response time 0.142s, size ~2.7MB — under 2s target. (Recorded.)
+- All existing tests still pass, including XSS escaping test. (56/56 passing.)
+#### Verification
+- `python -m unittest tests.test_app tests.test_sync -v`. 56/56 tests pass.
+- Synthetic-rows timing: 10.3k rows → 0.142s, ~2.7MB HTML.
+- `docker compose run --rm app python -m unittest` — pending Docker run.
+#### Security Check
+- Sort column from whitelist only; direction only `asc`/`desc`; nothing from request in SQL text.
+- Country validated against fixed list; exchanges passed as `?` parameters.
+- Header links built with `url_for` and autoescaped; no `|safe`.
+- `/health` returns `ok`, exposes no data, version or secrets.
+- Rendering all rows: ~2.7MB HTML for 10.3k rows — known size cost, acceptable for localhost-only app.
+
 ## Open Decisions (user)
 1. Run `git init` before Phase 1, so each phase can be reviewed by diff?
 2. Equities only for now, with ETFs as a one-constant change later?

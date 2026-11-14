@@ -46,27 +46,27 @@
   <label>Search:
     <input type="text" name="q" value="{{ q }}">
   </label>
-  <label>Sort:
-    <select name="sort">
-      <option value="ticker" {% if sort == "ticker" %}selected{% endif %}>Ticker</option>
-      <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
-      <option value="status_tag" {% if sort == "status_tag" %}selected{% endif %}>Status</option>
-    </select>
-    <select name="dir">
-      <option value="asc" {% if direction == "asc" %}selected{% endif %}>Asc</option>
-      <option value="desc" {% if direction == "desc" %}selected{% endif %}>Desc</option>
+  <label>Country:
+    <select name="country">
+      <option value="" {% if not country %}selected{% endif %}>All</option>
+      {% for country_name in countries %}
+      <option value="{{ country_name }}" {% if country == country_name %}selected{% endif %}>{{ country_name }}</option>
+      {% endfor %}
     </select>
   </label>
   <button type="submit">Filter</button>
 </form>
-<form method="post" action="{{ url_for('sync_now') }}">
+<form method="post" action="{{ url_for('sync_now') }}" style="margin:0; display:inline;">
   <button type="submit">Sync Now</button>
 </form>
 
 <table>
   <thead>
     <tr>
-      <th>Ticker</th><th>Name</th><th>Exchange</th><th>Open</th><th>Year High</th><th>Year Low</th><th>All-Time High</th><th>All-Time Low</th><th>Status</th><th>Updated</th>
+      {% for col, label in columns %}
+      {% set active = (sort == col) %}
+      <th><a href="{{ url_for('index', sort=col, dir='desc' if active and direction == 'asc' else 'asc', status=status or none, q=q or none, country=country or none) }}">{{ label }}{% if active %} {% if direction == 'asc' %}▲{% else %}▼{% endif %}{% endif %}</a></th>
+      {% endfor %}
     </tr>
   </thead>
   <tbody>
@@ -86,6 +86,6 @@
     {% endfor %}
   </tbody>
 </table>
-<p>{{ rows|length }} row(s) shown (capped at {{ row_cap }}).</p>
+<p>{{ rows|length }} row(s) shown.</p>
 </body>
 </html>
