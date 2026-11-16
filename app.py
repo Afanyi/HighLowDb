@@ -14,6 +14,7 @@ import sync
 import crypto_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 # The table renders ~10k rows; drop template indentation and newlines from the output.
@@ -28,7 +29,7 @@ if not (0 <= SYNC_HH <= 23 and 0 <= SYNC_MM <= 59):
 STATUS_PATTERN = re.compile(r"^(ACTIVE|DELISTED_OR_ZERO|NEW_\d{4})$")
 
 ALLOWED_SORTS = {
-    "ticker", "name", "exchange", "opening_price", "year_max", "year_min",
+    "ticker", "name", "exchange", "instrument_type", "opening_price", "year_max", "year_min",
     "all_time_max", "all_time_min", "status_tag", "last_updated",
 }
 # Distance columns: "% below highs" and "% above lows" of the current price.
@@ -56,6 +57,7 @@ STOCK_BASE_COLUMNS = [
     ("ticker", "Ticker"),
     ("name", "Name"),
     ("exchange", "Exchange"),
+    ("instrument_type", "Type"),
     ("opening_price", "Open"),
     ("year_max", "Year High"),
     ("year_min", "Year Low"),
@@ -86,7 +88,7 @@ MODES = {
         "search": ["ticker", "name"],
         "default_sort": ("ticker", "asc"),
         "sorts": {
-            "ticker", "name", "exchange", "opening_price", "year_max", "year_min",
+            "ticker", "name", "exchange", "instrument_type", "opening_price", "year_max", "year_min",
             "all_time_max", "all_time_min", "status_tag", "last_updated",
         },
     },
@@ -131,14 +133,23 @@ def next_run(now=None, hh=SYNC_HH, mm=SYNC_MM, weekdays_only=True):
     return candidate
 
 
+def _summary_counts(summary):
+    """Counts and timestamps only, for the log: lists such as failed_tickers are left out."""
+    return ", ".join(f"{k}={v}" for k, v in summary.items() if not isinstance(v, (list, dict)))
+
+
 def run_sync_job():
     """Run the stock sync if the lock is free; otherwise skip (no concurrent syncs)."""
     global last_summary
     if not _sync_lock.acquire(blocking=False):
+        log.info("stock sync skipped: already running")
         return
     try:
+        log.info("stock sync started")
         last_summary = sync.run_sync(db_path=DB_PATH)
+        log.info("stock sync finished: %s", _summary_counts(last_summary))
     except Exception as exc:  # noqa: BLE001
+        log.exception("stock sync failed")
         last_summary = {"error": str(exc)}
     finally:
         _sync_lock.release()
@@ -148,10 +159,14 @@ def run_crypto_sync_job():
     """Run the crypto sync if the lock is free; otherwise skip (no concurrent syncs)."""
     global last_crypto_summary
     if not _crypto_lock.acquire(blocking=False):
+        log.info("crypto sync skipped: already running")
         return
     try:
+        log.info("crypto sync started")
         last_crypto_summary = crypto_sync.run_sync(db_path=CRYPTO_DB_PATH)
+        log.info("crypto sync finished: %s", _summary_counts(last_crypto_summary))
     except Exception as exc:  # noqa: BLE001
+        log.exception("crypto sync failed")
         last_crypto_summary = {"error": str(exc)}
     finally:
         _crypto_lock.release()
@@ -176,7 +191,8 @@ threading.Thread(target=_scheduler_loop, args=(
 ), daemon=True).start()
 
 
-def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, sorts=None, bounds=None):
+def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, instrument_type=None,
+                sorts=None, bounds=None):
     cfg = MODES[mode]
     if sorts is None:
         sorts = [cfg["default_sort"]]
@@ -212,6 +228,9 @@ def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, sorts=None
             placeholders = ", ".join("?" for _ in exchanges)
             conditions.append(f"exchange IN ({placeholders})")
             params.extend(exchanges)
+    if instrument_type and mode == "stocks" and instrument_type in ("STOCK", "ETF"):
+        conditions.append("instrument_type = ?")
+        params.append(instrument_type)
     if bounds:
         for key, op, value in bounds:
             if key in DISTANCES and op in (">=", "<="):
@@ -325,6 +344,9 @@ def index():
     status = request.args.get("status", "").strip() or None
     q = request.args.get("q", "").strip() or None
     country = None if mode == "crypto" else (request.args.get("country", "").strip() or None)
+    instrument_type = None if mode == "crypto" else (request.args.get("instrument_type", "").strip() or None)
+    if instrument_type not in ("STOCK", "ETF"):
+        instrument_type = None
     group = request.args.get("group", "").strip()
     if group not in DISTANCES:
         group = None
@@ -337,6 +359,8 @@ def index():
         filters["q"] = q
     if country:
         filters["country"] = country
+    if instrument_type:
+        filters["instrument_type"] = instrument_type
     if group:
         filters["group"] = group
     for key in DISTANCES:
@@ -347,7 +371,8 @@ def index():
                 filters[f"{bound}_{key}"] = f"{value:g}"
     filters["mode"] = mode
     nav_filters = {k: v for k, v in filters.items() if k != "mode"}
-    rows = _query_rows(mode=mode, status=status, q=q, country=country, sorts=sorts, bounds=bounds)
+    rows = _query_rows(mode=mode, status=status, q=q, country=country,
+                       instrument_type=instrument_type, sorts=sorts, bounds=bounds)
     groups = _group_rows(rows, group)
     counts = collections.Counter(r["status_tag"] for r in rows)
     sort_markers = {}
@@ -385,6 +410,7 @@ def index():
         running=running,
         new_tag=new_tag,
         mode=mode,
+        instrument_type=instrument_type or "",
         sorts=sorts,
         sort_markers=sort_markers,
         header_urls=header_urls,

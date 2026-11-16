@@ -59,6 +59,52 @@ class TestNextRun(unittest.TestCase):
             app_module._sync_lock.release()
 
 
+class TestSyncJobLogging(unittest.TestCase):
+    def test_stock_sync_logs_start_and_summary_without_lists(self):
+        summary = {"ok": 7, "no_data": 1, "failed": 1, "unmapped": 2, "failed_tickers": ["AAPL_US_EQ"],
+                   "started_at": "2026-11-14T22:00:00", "finished_at": "2026-11-15T02:00:00"}
+        with patch.object(app_module.sync, "run_sync", return_value=summary), \
+                self.assertLogs("app", level="INFO") as logs:
+            app_module.run_sync_job()
+        out = "\n".join(logs.output)
+        self.assertIn("stock sync started", out)
+        self.assertIn("stock sync finished: ok=7, no_data=1, failed=1, unmapped=2", out)
+        self.assertIn("finished_at=2026-11-15T02:00:00", out)
+        self.assertNotIn("AAPL_US_EQ", out)
+
+    def test_crypto_sync_logs_start_and_summary(self):
+        summary = {"coins": 18230, "backfilled": 200, "backfill_pending": 18030, "failed": 0, "calls": 274,
+                   "started_at": "a", "finished_at": "b"}
+        with patch.object(app_module.crypto_sync, "run_sync", return_value=summary), \
+                self.assertLogs("app", level="INFO") as logs:
+            app_module.run_crypto_sync_job()
+        out = "\n".join(logs.output)
+        self.assertIn("crypto sync started", out)
+        self.assertIn("crypto sync finished: coins=18230, backfilled=200", out)
+
+    def test_failed_sync_logs_error_with_traceback(self):
+        for job, module, name in ((app_module.run_sync_job, app_module.sync, "stock"),
+                                  (app_module.run_crypto_sync_job, app_module.crypto_sync, "crypto")):
+            with patch.object(module, "run_sync", side_effect=RuntimeError("boom")), \
+                    self.assertLogs("app", level="ERROR") as logs:
+                job()
+            out = "\n".join(logs.output)
+            self.assertIn(f"ERROR:app:{name} sync failed", out)
+            self.assertIn("Traceback", out)
+            self.assertIn("RuntimeError: boom", out)
+
+    def test_skipped_sync_logs_line(self):
+        for job, lock, name in ((app_module.run_sync_job, app_module._sync_lock, "stock"),
+                                (app_module.run_crypto_sync_job, app_module._crypto_lock, "crypto")):
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                with self.assertLogs("app", level="INFO") as logs:
+                    job()
+            finally:
+                lock.release()
+            self.assertIn(f"{name} sync skipped: already running", "\n".join(logs.output))
+
+
 class TestAppRoutes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -166,6 +212,47 @@ class TestAppRoutes(unittest.TestCase):
         filter_start = html.index('<form method="get"')
         filter_end = html.index("</form>", filter_start)
         self.assertNotIn('method="post"', html[filter_start:filter_end])
+
+    def test_type_column_rendered(self):
+        resp = self.client.get("/")
+        html = resp.get_data(as_text=True)
+        self.assertIn("Type", html)
+        self.assertIn("STOCK", html)
+
+    def test_filter_row_lines_up_with_header(self):
+        for mode in ("stocks", "crypto"):
+            html = self.client.get(f"/?mode={mode}").get_data(as_text=True)
+            header, filters = html.split("<thead")[1].split("</thead>")[0].split("<tr")[1:3]
+            cells = [sum(int(m.group(1) or 1) for m in re.finditer(r'<th(?:\s+colspan="(\d+)")?[\s>]', row))
+                     for row in (header, filters)]
+            self.assertEqual(cells[0], cells[1], mode)
+
+    def test_type_filter_stock(self):
+        resp = self.client.get("/?instrument_type=STOCK")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+
+    def test_type_filter_etf(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO stocks (ticker, name, exchange, instrument_type, status_tag, last_updated) "
+            "VALUES ('SPY_US_EQ', 'SPY ETF', 'US', 'ETF', 'ACTIVE', datetime('now'))")
+        conn.commit()
+        conn.close()
+        resp = self.client.get("/?instrument_type=ETF")
+        html = resp.get_data(as_text=True)
+        self.assertIn("SPY_US_EQ", html)
+        self.assertNotIn("AAPL_US_EQ", html)
+        resp = self.client.get("/?instrument_type=STOCK")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+        self.assertNotIn("SPY_US_EQ", html)
+
+    def test_type_filter_bad_value_ignored(self):
+        resp = self.client.get("/?instrument_type=bogus")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+        self.assertIn('value="" selected', html)
 
     def test_summary_shown(self):
         app_module.last_summary = {
@@ -886,6 +973,9 @@ class TestCryptoMode(unittest.TestCase):
     def test_search_label_follows_mode(self):
         self.assertIn('aria-label="Search symbol or name"', self.client.get("/?mode=crypto").get_data(as_text=True))
         self.assertIn('aria-label="Search ticker or name"', self.client.get("/").get_data(as_text=True))
+
+    def test_crypto_mode_no_type_filter(self):
+        self.assertNotIn('name="instrument_type"', self.client.get("/?mode=crypto").get_data(as_text=True))
 
     def test_new_this_year_status_only_in_stock_mode(self):
         self.assertNotIn("New this year</option>", self.client.get("/?mode=crypto").get_data(as_text=True))

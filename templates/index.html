@@ -157,6 +157,13 @@
               {% endfor %}
             </select>
           </th>
+          <th>
+            <select name="instrument_type" form="filters" aria-label="Type" class="form-select form-select-sm{% if instrument_type %} active-filter{% endif %}">
+              <option value="" {% if not instrument_type %}selected{% endif %}>All types</option>
+              <option value="STOCK" {% if instrument_type == "STOCK" %}selected{% endif %}>Stock</option>
+              <option value="ETF" {% if instrument_type == "ETF" %}selected{% endif %}>ETF</option>
+            </select>
+          </th>
           <th colspan="5"></th>
           {% else %}
           <th colspan="6"></th>
@@ -203,7 +210,7 @@
 {% if mode == "crypto" %}
   <td>{{ row["market_cap_rank"] or "—" }}</td><td>{{ row["symbol"] or "—" }}</td><td>{{ row["name"] or "—" }}</td>
 {% else %}
-  <td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td>
+  <td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td><td>{{ row["instrument_type"] or "—" }}</td>
 {% endif %}
 {%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key], crypto=(mode == "crypto")) }}</td>{% endfor -%}
 <td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>

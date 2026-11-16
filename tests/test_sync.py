@@ -19,6 +19,9 @@ class TestToYahoo(unittest.TestCase):
     def test_london_ticker(self):
         self.assertEqual(sync.to_yahoo("BPl_EQ"), ("BP.L", "LSE"))
 
+    def test_milan_ticker(self):
+        self.assertEqual(sync.to_yahoo("XYZm_EQ"), ("XYZ.MI", "MILAN"))
+
     def test_german_ticker(self):
         self.assertEqual(sync.to_yahoo("TLSd_EQ"), ("TLS.F", "FRANKFURT"))
 
@@ -263,15 +266,16 @@ class TestRunSync(unittest.TestCase):
             "AAPL": [_hist([100.0] * 9 + [last_open], self.DATES)],
             # A trailing all-NaN row is dropped, so the last real open is used.
             "BP.L": [_hist([5.0] * 9 + [float("nan")], self.DATES)],
+            "SPY": [_hist([400.0] * 10, self.DATES)],
             "NOPE": [YFPricesMissingError("NOPE", "")],
         }
 
     def test_counts_and_rows(self):
         summary, _ = self._run(self._ok())
         self.assertEqual(
-            (summary["ok"], summary["no_data"], summary["failed"], summary["unmapped"]), (2, 1, 0, 1))
+            (summary["ok"], summary["no_data"], summary["failed"], summary["unmapped"]), (3, 1, 0, 1))
         rows = self._rows()
-        self.assertEqual(set(rows), {"AAPL_US_EQ", "BPl_EQ"})
+        self.assertEqual(set(rows), {"AAPL_US_EQ", "BPl_EQ", "SPY_US_EQ"})
         self.assertEqual(rows["AAPL_US_EQ"], ("Apple Inc.", "US", 100.0, "ACTIVE"))
         self.assertEqual(rows["BPl_EQ"], ("BP plc", "LSE", 5.0, "ACTIVE"))
 
@@ -279,14 +283,14 @@ class TestRunSync(unittest.TestCase):
         self._run(self._ok(100.0))
         self._run(self._ok(150.0))
         rows = self._rows()
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows["AAPL_US_EQ"][2], 150.0)
 
     def test_rate_limit_waits_and_retries_without_failing(self):
         responses = self._ok()
         responses["AAPL"] = [YFRateLimitError(), YFRateLimitError(), responses["AAPL"][0]]
         summary, _ = self._run(responses)
-        self.assertEqual((summary["ok"], summary["failed"]), (2, 0))
+        self.assertEqual((summary["ok"], summary["failed"]), (3, 0))
         waits = [c.args[0] for c in self.sleep.call_args_list]
         self.assertIn(sync.RATE_LIMIT_BACKOFF, waits)
         self.assertIn(sync.RATE_LIMIT_BACKOFF * 2, waits)
@@ -296,14 +300,14 @@ class TestRunSync(unittest.TestCase):
         flaky = [ConnectionError("reset")] * (sync.MAX_ATTEMPTS + 1)
         responses["BP.L"] = flaky + responses["BP.L"]
         summary, _ = self._run(responses)
-        self.assertEqual((summary["ok"], summary["failed"]), (2, 0))
+        self.assertEqual((summary["ok"], summary["failed"]), (3, 0))
         self.assertIn("BPl_EQ", self._rows())
 
     def test_persistent_errors_reported_as_failed(self):
         responses = self._ok()
         responses["BP.L"] = [ConnectionError("down")]
         summary, _ = self._run(responses)
-        self.assertEqual((summary["ok"], summary["failed"]), (1, 1))
+        self.assertEqual((summary["ok"], summary["failed"]), (2, 1))
         self.assertEqual(summary["failed_tickers"], ["BPl_EQ"])
 
     def test_empty_history_counts_as_no_data(self):
@@ -311,6 +315,45 @@ class TestRunSync(unittest.TestCase):
         responses["NOPE"] = [_hist([], [])]
         summary, _ = self._run(responses)
         self.assertEqual((summary["no_data"], summary["failed"]), (1, 0))
+
+    def test_etf_kept_warrant_excluded_type_stored(self):
+        instruments = [
+            {"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple"},
+            {"ticker": "SPY_US_EQ", "type": "ETF", "name": "SPY"},
+            {"ticker": "WRNT_WS_EQ", "type": "WARRANT", "name": "Warrant"},
+        ]
+        responses = {
+            "AAPL": self._ok()["AAPL"],
+            "SPY": [_hist([400.0] * 10, self.DATES)],
+        }
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker", side_effect=self._ticker_mock(responses)):
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["unmapped"], 0)  # the warrant is excluded, not unmapped
+        conn = sqlite3.connect(self.db_path)
+        try:
+            types = {row[0] for row in conn.execute("SELECT DISTINCT instrument_type FROM stocks")}
+        finally:
+            conn.close()
+        self.assertEqual(types, {"STOCK", "ETF"})
+
+    def _ticker_mock(self, responses):
+        calls = {k: list(v) for k, v in responses.items()}
+
+        def factory(symbol):
+            t = MagicMock()
+
+            def history(**kwargs):
+                result = calls[symbol].pop(0) if len(calls[symbol]) > 1 else calls[symbol][0]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            t.history.side_effect = history
+            return t
+
+        return factory
 
 
 class TestExchangeCountries(unittest.TestCase):
@@ -326,6 +369,230 @@ class TestExchangeCountries(unittest.TestCase):
         for exchange, country in sync.EXCHANGE_COUNTRIES.items():
             self.assertTrue(exchange)
             self.assertTrue(country)
+
+
+class TestIsinFallback(unittest.TestCase):
+    DATES = pd.date_range("2024-01-02", periods=10, freq="D")
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+        self.sleep = patch("sync.time.sleep").start()
+        self.addCleanup(patch.stopall)
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def _hist(self, opens):
+        return pd.DataFrame(
+            {"Open": opens, "High": [o + 10 for o in opens], "Low": [o - 10 for o in opens],
+             "Close": [o + 5 for o in opens]},
+            index=self.DATES,
+        )
+
+    def _empty_hist(self):
+        return pd.DataFrame(
+            {"Open": [], "High": [], "Low": [], "Close": []},
+            index=pd.DatetimeIndex([]),
+        )
+
+    def _ticker(self, responses):
+        calls = {k: list(v) for k, v in responses.items()}
+
+        def factory(symbol):
+            t = MagicMock()
+
+            def history(**kwargs):
+                result = calls[symbol].pop(0) if len(calls[symbol]) > 1 else calls[symbol][0]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            t.history.side_effect = history
+            return t
+
+        return factory
+
+    def _run(self, instruments, responses, isin_lookup=None):
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker", side_effect=self._ticker(responses)), \
+                patch("sync.get_ticker_by_isin", side_effect=isin_lookup or (lambda isin: None)):
+            return sync.run_sync(db_path=self.db_path)
+
+    def _rows(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return {r[0]: r[1:] for r in conn.execute(
+                "SELECT ticker, name, exchange, opening_price, status_tag, instrument_type FROM stocks")}
+        finally:
+            conn.close()
+
+    def test_init_db_adds_instrument_type_and_yahoo_symbols(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            names = {row[1] for row in conn.execute("PRAGMA table_info(stocks)")}
+            self.assertIn("instrument_type", names)
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("yahoo_symbols", tables)
+        finally:
+            conn.close()
+
+    def test_init_db_migrates_existing_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "CREATE TABLE stocks (ticker TEXT PRIMARY KEY, name TEXT, exchange TEXT, "
+            "opening_price REAL, year_max REAL, year_min REAL, all_time_max REAL, "
+            "all_time_min REAL, status_tag TEXT, last_updated TEXT)")
+        conn.execute(
+            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "all_time_max, all_time_min, status_tag, last_updated) "
+            "VALUES ('AAPL_US_EQ', 'Apple', 'US', 100.0, 110.0, 90.0, 150.0, 80.0, 'ACTIVE', datetime('now'))")
+        conn.commit()
+        conn.close()
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            names = {row[1] for row in conn.execute("PRAGMA table_info(stocks)")}
+            self.assertIn("instrument_type", names)
+            row = conn.execute("SELECT instrument_type FROM stocks WHERE ticker='AAPL_US_EQ'").fetchone()
+            self.assertEqual(row[0], "STOCK")
+        finally:
+            conn.close()
+
+    def test_unmapped_ticker_with_isin_is_resolved(self):
+        instruments = [{"ticker": "ABC_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000000"}]
+
+        def isin_lookup(isin):
+            self.assertEqual(isin, "US0000000000")
+            return "GENI"
+
+        summary = self._run(instruments, {"GENI": [self._hist([100.0] * 10)]}, isin_lookup)
+        self.assertEqual(summary["resolved_by_isin"], 1)
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["unmapped"], 0)
+        self.assertEqual(self._rows()["ABC_EQ"][4], "STOCK")
+
+    def test_resolved_symbol_on_another_exchange_is_rejected(self):
+        instruments = [{"ticker": "ABC_US_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000001"}]
+        summary = self._run(
+            instruments, {"ABC": [self._empty_hist()], "EMY.F": [self._hist([100.0] * 10)]},
+            isin_lookup=lambda isin: "EMY.F",
+        )
+        self.assertEqual(summary["resolved_by_isin"], 0)
+        self.assertEqual(summary["ok"], 0)
+        self.assertEqual(summary["no_data"], 1)
+
+    def test_saved_match_is_reused_without_isin_lookup(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO yahoo_symbols (ticker, yahoo_symbol, resolved_at) "
+            "VALUES ('ABC_EQ', 'GENI', datetime('now'))")
+        conn.commit()
+        conn.close()
+        instruments = [{"ticker": "ABC_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000000"}]
+        called = []
+        summary = self._run(
+            instruments, {"GENI": [self._hist([100.0] * 10)]},
+            isin_lookup=lambda isin: called.append(isin) or None,
+        )
+        self.assertEqual(called, [])
+        self.assertEqual(summary["resolved_by_isin"], 0)
+        self.assertEqual(summary["ok"], 1)
+
+    def test_saved_match_with_no_data_is_resolved_again(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO yahoo_symbols (ticker, yahoo_symbol, resolved_at) "
+            "VALUES ('ABC_EQ', 'OLDSYM', datetime('now'))")
+        conn.commit()
+        conn.close()
+        instruments = [{"ticker": "ABC_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000000"}]
+        summary = self._run(
+            instruments, {"OLDSYM": [self._empty_hist()], "GENI": [self._hist([100.0] * 10)]},
+            isin_lookup=lambda isin: "GENI",
+        )
+        self.assertEqual(summary["resolved_by_isin"], 1)
+        self.assertEqual(summary["ok"], 1)
+
+    def _saved(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return dict(conn.execute("SELECT ticker, yahoo_symbol FROM yahoo_symbols"))
+        finally:
+            conn.close()
+
+    def test_mapped_ticker_without_data_is_recovered_by_isin(self):
+        instruments = [{"ticker": "DMYD_US_EQ", "type": "STOCK", "name": "Genius", "isin": "GG00BMF1JR16"}]
+        summary = self._run(
+            instruments, {"DMYD": [self._empty_hist()], "GENI": [self._hist([100.0] * 10)]},
+            isin_lookup=lambda isin: "GENI",
+        )
+        self.assertEqual((summary["ok"], summary["no_data"], summary["resolved_by_isin"]), (1, 0, 1))
+        self.assertEqual(self._rows()["DMYD_US_EQ"][1], "US")
+        self.assertEqual(self._saved(), {"DMYD_US_EQ": "GENI"})
+
+    def test_saved_match_of_mapped_ticker_is_reused_on_second_run(self):
+        instruments = [{"ticker": "DMYD_US_EQ", "type": "STOCK", "name": "Genius", "isin": "GG00BMF1JR16"}]
+        responses = {"DMYD": [self._empty_hist()], "GENI": [self._hist([100.0] * 10)]}
+        lookups = []
+        self._run(instruments, responses, isin_lookup=lambda isin: lookups.append(isin) or "GENI")
+        requested = []
+        factory = self._ticker(responses)
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker", side_effect=lambda s: requested.append(s) or factory(s)), \
+                patch("sync.get_ticker_by_isin", side_effect=lambda isin: lookups.append(isin) or "GENI"):
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual(requested, ["GENI"])
+        self.assertEqual((summary["ok"], summary["resolved_by_isin"]), (1, 0))
+
+    def test_instruments_sharing_a_yahoo_symbol_both_get_rows(self):
+        instruments = [{"ticker": "3ASMl_EQ", "type": "ETF", "name": "Main", "isin": "XS0000000001"},
+                       {"ticker": "3ASMl1_EQ", "type": "ETF", "name": "Second", "isin": "XS0000000001"}]
+        summary = self._run(instruments, {"3ASM.L": [self._hist([100.0] * 10)]},
+                            isin_lookup=lambda isin: "3ASM.L")
+        self.assertEqual(sorted(self._rows()), ["3ASMl1_EQ", "3ASMl_EQ"])
+        self.assertEqual((summary["ok"], summary["no_data"], summary["failed"]), (2, 0, 0))
+
+    def test_upsert_error_after_isin_match_is_retried_not_crashing(self):
+        instruments = [{"ticker": "DMYD_US_EQ", "type": "STOCK", "name": "Genius", "isin": "GG00BMF1JR16"}]
+        real_upsert = sync._upsert
+        calls = []
+
+        def flaky_upsert(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_upsert(*args)
+
+        with patch("sync._upsert", side_effect=flaky_upsert):
+            summary = self._run(
+                instruments, {"DMYD": [self._empty_hist()], "GENI": [self._hist([100.0] * 10)]},
+                isin_lookup=lambda isin: "GENI",
+            )
+        self.assertEqual((summary["ok"], summary["failed"], summary["resolved_by_isin"]), (1, 0, 1))
+        self.assertEqual(summary["failed_tickers"], [])
+
+    def test_isin_match_without_data_is_not_saved_or_counted(self):
+        instruments = [{"ticker": "OLD_US_EQ", "type": "STOCK", "name": "Old", "isin": "US0000000002"}]
+        summary = self._run(
+            instruments, {"OLD": [self._empty_hist()], "NEW": [self._empty_hist()]},
+            isin_lookup=lambda isin: "NEW",
+        )
+        self.assertEqual((summary["ok"], summary["no_data"], summary["resolved_by_isin"]), (0, 1, 0))
+        self.assertEqual(self._saved(), {})
+
+    def test_isin_without_match_counts_as_unmapped(self):
+        instruments = [{"ticker": "ABC_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000000"}]
+        summary = self._run(instruments, {}, isin_lookup=lambda isin: None)
+        self.assertEqual(summary["resolved_by_isin"], 0)
+        self.assertEqual(summary["unmapped"], 1)
+        self.assertEqual(summary["ok"], 0)
 
 
 if __name__ == "__main__":
