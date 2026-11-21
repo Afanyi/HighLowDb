@@ -42,3 +42,8 @@ Compose upstream and the proposed route for its existing Caddy proxy. These file
 prepare deployment; the setup/update scripts and live rollout are later phases.
 Code deployment stays manual. Automatic stock-data updates continue to use the
 existing weekday `SYNC_TIME_UTC` scheduler, independently of browser access.
+
+The dashboard shows the next scheduled refresh, last attempt, last successful
+completion and stale-data warnings. Refresh status survives container recreation.
+Private deployment coordination and its CLI are described in
+[the deployment notes](docs/deployment.md#refresh-status-and-deployment-coordination).

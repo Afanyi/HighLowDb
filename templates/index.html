@@ -36,6 +36,8 @@
       <span class="badge text-bg-warning me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Sync running…</span>
     {% elif summary and summary.error %}
       <span class="badge text-bg-danger me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Error: {{ summary.error }}</span>
+    {% elif refresh.state == "partial" %}
+      <span class="badge text-bg-warning me-2">Completed with gaps: {{ refresh.summary.failed or 0 }} failed</span>
     {% elif summary %}
       {% if mode == "crypto" %}
         <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.coins }} coins, Backfilled: {{ summary.backfilled }}, Failed: {{ summary.failed }}</span>
@@ -49,6 +51,20 @@
     </form>
   </div>
 </nav>
+
+<div class="alert {% if refresh.stale %}alert-warning{% else %}alert-light border{% endif %} py-2" role="status">
+  {% if refresh.state == "unavailable" %}
+    Refresh status unavailable. Check server logs; HTTP health does not prove data is current.
+  {% else %}
+    <strong>{{ "Stock" if mode == "stocks" else "Crypto" }} updates:</strong> {{ refresh.schedule }}.
+    Next scheduled: {{ refresh.next_run }}{% if refresh.overdue %} (refresh pending){% endif %}.<br>
+    Last attempt: {{ refresh.state }}{% if refresh.source %} ({{ refresh.source }}){% endif %}
+    {% if refresh.started_at %} · {{ refresh.started_at }} → {{ refresh.finished_at or "running" }}{% endif %}.
+    Last successful refresh: {{ refresh.last_success_at or "Never recorded" }}.
+    {% if refresh.stale %}<strong>Data is stale or no successful refresh has been recorded.</strong>{% endif %}
+    {% if refresh.paused %}<br>Updates are paused for deployment; scheduled updates will resume automatically.{% endif %}
+  {% endif %}
+</div>
 
 <div class="row g-3 mb-3">
   <div class="col-6 col-md-3">

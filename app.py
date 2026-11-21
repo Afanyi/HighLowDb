@@ -7,13 +7,15 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from flask import Flask, abort, render_template, request, redirect, session, url_for
 
 import sync
 import crypto_sync
+import refresh
+from refresh import next_run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -186,75 +188,82 @@ last_summary = None
 last_crypto_summary = None
 
 
-def next_run(now=None, hh=SYNC_HH, mm=SYNC_MM, weekdays_only=True):
-    """Return the next run at hh:mm UTC strictly after ``now``.
-
-    When ``weekdays_only`` is False the run fires every day (crypto trades 24/7).
-    """
-    now = now or datetime.now(timezone.utc)
-    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    while candidate <= now or (weekdays_only and candidate.weekday() >= 5):
-        candidate += timedelta(days=1)
-        candidate = candidate.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return candidate
-
-
 def _summary_counts(summary):
     """Counts and timestamps only, for the log: lists such as failed_tickers are left out."""
     return ", ".join(f"{k}={v}" for k, v in summary.items() if not isinstance(v, (list, dict)))
 
 
-def run_sync_job():
-    """Run the stock sync if the lock is free; otherwise skip (no concurrent syncs)."""
-    global last_summary
-    if not _sync_lock.acquire(blocking=False):
-        log.info("stock sync skipped: already running")
-        return
+def _run_job(mode, source):
+    global last_summary, last_crypto_summary
+    lock = _sync_lock if mode == "stocks" else _crypto_lock
+    label = "stock" if mode == "stocks" else "crypto"
+    if not lock.acquire(blocking=False):
+        log.info("%s sync skipped: already running", label)
+        return False
     try:
-        log.info("stock sync started")
-        last_summary = sync.run_sync(db_path=DB_PATH)
-        log.info("stock sync finished: %s", _summary_counts(last_summary))
-    except Exception as exc:  # noqa: BLE001
-        log.exception("stock sync failed")
-        last_summary = {"error": str(exc)}
+        with refresh.job_guard(DB_PATH, mode) as admitted:
+            if not admitted:
+                log.info("%s sync deferred: deployment or refresh in progress", label)
+                return False
+            started = datetime.now(timezone.utc)
+            if source == "scheduled" and refresh.ready_at(DB_PATH, mode, started) > started:
+                return True  # A manual/other worker completed the due slot before admission.
+            refresh.started(DB_PATH, mode, source, started)
+            log.info("%s sync started (%s)", label, source)
+            result, error = {}, None
+            try:
+                result = (sync.run_sync(db_path=DB_PATH) if mode == "stocks"
+                          else crypto_sync.run_sync(db_path=CRYPTO_DB_PATH))
+                if not isinstance(result, dict):
+                    raise TypeError("Invalid sync summary")
+            except Exception as exc:  # noqa: BLE001
+                # Provider exception text can contain credentials. Persist/display
+                # only the failure type; retain the previous success timestamp.
+                result, error = {}, f"Refresh failed ({type(exc).__name__})"
+                log.error("%s sync failed (%s)", label, type(exc).__name__)
+            finished = datetime.now(timezone.utc)
+            refresh.finished(DB_PATH, mode, result, error, finished)
+            summary = {k: v for k, v in result.items() if k in refresh.COUNTS and type(v) is int and v >= 0}
+            summary.update(started_at=started.isoformat(), finished_at=finished.isoformat())
+            if error:
+                summary["error"] = error
+            if mode == "stocks":
+                last_summary = summary
+            else:
+                last_crypto_summary = summary
+            if not error:
+                log.info("%s sync finished: %s", label, _summary_counts(summary))
+            return True
     finally:
-        _sync_lock.release()
+        lock.release()
 
 
-def run_crypto_sync_job():
-    """Run the crypto sync if the lock is free; otherwise skip (no concurrent syncs)."""
-    global last_crypto_summary
-    if not _crypto_lock.acquire(blocking=False):
-        log.info("crypto sync skipped: already running")
-        return
-    try:
-        log.info("crypto sync started")
-        last_crypto_summary = crypto_sync.run_sync(db_path=CRYPTO_DB_PATH)
-        log.info("crypto sync finished: %s", _summary_counts(last_crypto_summary))
-    except Exception as exc:  # noqa: BLE001
-        log.exception("crypto sync failed")
-        last_crypto_summary = {"error": str(exc)}
-    finally:
-        _crypto_lock.release()
+def run_sync_job(source="manual"):
+    return _run_job("stocks", source)
 
 
-def _scheduler_loop(get_next_run, run_job):
+def run_crypto_sync_job(source="manual"):
+    return _run_job("crypto", source)
+
+
+def _scheduler_loop(mode, run_job, state_db_path):
     while True:
-        nr = get_next_run()
-        wait = (nr - datetime.now(timezone.utc)).total_seconds()
-        if wait > 0:
-            time.sleep(wait)
-        run_job()
+        try:
+            now = datetime.now(timezone.utc)
+            due = refresh.ready_at(state_db_path, mode, now)
+            wait = (due - now).total_seconds()
+            if wait > 0:
+                time.sleep(wait)
+                continue  # Re-read: a manual run may have satisfied this slot.
+            if not run_job(source="scheduled"):
+                time.sleep(1)  # Keep the durable due time while deployment holds the gate.
+        except Exception as exc:  # noqa: BLE001
+            log.error("%s scheduler unavailable (%s); retrying", mode, type(exc).__name__)
+            time.sleep(30)
 
 
-threading.Thread(target=_scheduler_loop, args=(
-    lambda: next_run(hh=SYNC_HH, mm=SYNC_MM),
-    run_sync_job,
-), daemon=True).start()
-threading.Thread(target=_scheduler_loop, args=(
-    lambda: next_run(hh=CRYPTO_HH, mm=CRYPTO_MM, weekdays_only=False),
-    run_crypto_sync_job,
-), daemon=True).start()
+threading.Thread(target=_scheduler_loop, args=("stocks", run_sync_job, DB_PATH), daemon=True).start()
+threading.Thread(target=_scheduler_loop, args=("crypto", run_crypto_sync_job, DB_PATH), daemon=True).start()
 
 
 def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, instrument_type=None,
@@ -459,11 +468,23 @@ def index():
     else:
         running = _sync_lock.locked()
         summary = last_summary
+    try:
+        refresh_status = refresh.status(DB_PATH, mode)
+        if summary is None and refresh_status["started_at"]:
+            summary = dict(refresh_status["summary"], started_at=refresh_status["started_at"],
+                           finished_at=refresh_status["finished_at"])
+            if refresh_status["error"]:
+                summary["error"] = refresh_status["error"]
+        running = running or refresh_status["state"] == "running"
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        log.error("Refresh status unavailable (%s)", type(exc).__name__)
+        refresh_status = {"state": "unavailable", "stale": True}
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
     return render_template(
         "index.html",
         csrf_token=session["csrf_token"],
+        refresh=refresh_status,
         groups=groups,
         group=group or "",
         status=status or "",

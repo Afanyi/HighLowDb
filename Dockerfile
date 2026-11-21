@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --system --uid 10001 --no-create-home app \
     && mkdir /data && chown app:app /data
 
-COPY sync.py app.py crypto_sync.py ./
+COPY sync.py app.py crypto_sync.py refresh.py ./
 COPY templates/ templates/
 COPY tests/ tests/
 

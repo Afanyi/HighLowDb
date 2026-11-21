@@ -60,6 +60,10 @@ class TestNextRun(unittest.TestCase):
 
 
 class TestSyncJobLogging(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(app_module, "DB_PATH", directory + "/stocks.db"))
+
     def test_stock_sync_logs_start_and_summary_without_lists(self):
         summary = {"ok": 7, "no_data": 1, "failed": 1, "unmapped": 2, "failed_tickers": ["AAPL_US_EQ"],
                    "started_at": "2026-11-14T22:00:00", "finished_at": "2026-11-15T02:00:00"}
@@ -69,7 +73,7 @@ class TestSyncJobLogging(unittest.TestCase):
         out = "\n".join(logs.output)
         self.assertIn("stock sync started", out)
         self.assertIn("stock sync finished: ok=7, no_data=1, failed=1, unmapped=2", out)
-        self.assertIn("finished_at=2026-11-15T02:00:00", out)
+        self.assertIn("finished_at=", out)
         self.assertNotIn("AAPL_US_EQ", out)
 
     def test_crypto_sync_logs_start_and_summary(self):
@@ -82,7 +86,7 @@ class TestSyncJobLogging(unittest.TestCase):
         self.assertIn("crypto sync started", out)
         self.assertIn("crypto sync finished: coins=18230, backfilled=200", out)
 
-    def test_failed_sync_logs_error_with_traceback(self):
+    def test_failed_sync_logs_type_without_provider_exception_text(self):
         for job, module, name in ((app_module.run_sync_job, app_module.sync, "stock"),
                                   (app_module.run_crypto_sync_job, app_module.crypto_sync, "crypto")):
             with patch.object(module, "run_sync", side_effect=RuntimeError("boom")), \
@@ -90,8 +94,8 @@ class TestSyncJobLogging(unittest.TestCase):
                 job()
             out = "\n".join(logs.output)
             self.assertIn(f"ERROR:app:{name} sync failed", out)
-            self.assertIn("Traceback", out)
-            self.assertIn("RuntimeError: boom", out)
+            self.assertIn("RuntimeError", out)
+            self.assertNotIn("boom", out)
 
     def test_skipped_sync_logs_line(self):
         for job, lock, name in ((app_module.run_sync_job, app_module._sync_lock, "stock"),

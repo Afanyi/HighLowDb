@@ -312,7 +312,7 @@ secret handling and project/network/volume isolation before enabling ingress.
 
 ### Phase 2: Make scheduled data refreshes observable and safe during updates
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 1
 
 #### Goal
@@ -379,6 +379,131 @@ the focused checks pass.
 Keep maintenance controls private; expose no tokens in status/errors; validate
 persisted status and coordination files/paths; reject browser attempts to control
 deployment. Ensure test scheduler threads cannot use production keys or data.
+
+#### Execution Evidence (2026-11-21)
+
+- Added `refresh.py` for private SQLite status and file-lock coordination, copied
+  into the image by `Dockerfile`. It imports no web app/provider modules and adds
+  no dependency. Metadata and lock files live beside the stock DB on `/data`;
+  stock/crypto data schemas, providers and configured schedule times are unchanged.
+- Reused both app scheduler threads and per-dataset thread locks. The common job
+  wrapper records safe counts and actual timestamps/source for manual/scheduled
+  attempts; failure/partial coverage preserves the previous full-success timestamp.
+  The dashboard restores status after restarts and shows next runs, stale data,
+  paused updates and unavailable status independently of `/health`.
+- Jobs hold shared deployment and exclusive dataset file locks throughout provider
+  work and status commit. The private `hold` CLI waits for exclusive access with
+  a finite timeout, announces readiness, then holds until stdin closes. EOF, helper
+  death and exceptions release the gate automatically; no public control route.
+  Phase 3 will manage this helper across cutover; no deployment scripts were added.
+- Due times persist through maintenance/restart. Scheduled admission rechecks due
+  state after locking, preventing a manual completion race. Pending missed days
+  coalesce into one recovery run; stock weekends defer to Monday's configured slot,
+  and crypto remains daily. Interrupted uncommitted runs are never called successful.
+- **184 unittests passed** in the final built image, with dummy keys, `/tmp`
+  databases and `--network none` (19.328 seconds). Includes 22 focused new tests
+  for durable timestamps/summary, stale/partial/failure states, cross-process locks,
+  helper death, active-job draining, timeout/failure cleanup, pending-slot recovery,
+  manual/scheduled races, weekend/daily semantics, private-file rejection,
+  scheduler storage recovery and absence of browser maintenance routes.
+- `docker build -t allstocksdatabase-phase2-check:local .` passed.
+  `python3 tests/check_production.py` passed with the new module mounted: private
+  Compose configuration, verified test-CA HTTPS, authentication and CSRF behavior
+  remained intact. This test used an isolated network and dummy credentials.
+- Two fresh containers using the built image and one temporary named volume
+  retained both fake datasets, completion timestamps, counts and future due times.
+  Dashboard reads succeeded after recreation; fake providers were not called
+  again for completed/future slots. The temporary volume was removed afterward.
+- Security self-check: no raw provider text or unknown summary fields persisted
+  or logged by the wrapper; private owned regular files required, with symlink/
+  hard-link/shared-file rejection; maintenance stays CLI-only, no Docker socket
+  mount or production keys in tests. No security blocker found.
+- The README and `docs/deployment.md` describe status, recovery semantics and the
+  helper protocol for Phase 3. No server change, real provider request or code
+  auto-deployment occurred. Stop for Phase 2 review; Phases 3–4 remain `Not Started`.
+
+#### Initial Review Result (2026-11-21; before R1 rework)
+
+- **Review Failed.** One blocking correctness finding; no confirmed security
+  blocker or optional finding identified. Reviewed actual diffs, the new module,
+  tests and documentation against the Phase 2 scope and acceptance criteria.
+- **R1 — Preserve weekend deferral through Monday startup.**
+  `refresh.py:130–134` only applies the Monday deferral while `now.weekday() >= 5`.
+  The matching display logic at `refresh.py:184` has the same condition. The
+  deferred eligibility is never persisted, so restarting before Monday's
+  configured slot admits the old Friday due time immediately. This contradicts
+  the stated weekend recovery behavior and can cause two automatic provider runs
+  on Monday instead of coalescing the missed slot into the configured run.
+- Confirmed with a controlled clock, fake provider, temporary metadata and no
+  external network: initialize Friday 2026-01-09 at 14:44 UTC; on Saturday status
+  advertises Monday 2026-01-12 at 14:45 UTC. At Monday 00:01 UTC,
+  `run_sync_job(source='scheduled')` invokes the fake provider once and completes;
+  the next due time is still Monday 14:45 UTC. No real provider call was made.
+- Required rework: carry/reconstruct weekend-deferred eligibility consistently
+  across worker/container restarts in scheduler admission and displayed status.
+  Add a regression covering Friday pending → Saturday deferral → Monday startup
+  before the configured slot, verifying zero early calls and one call at/after
+  the configured time. Retain immediate weekday recovery for deployment crossing
+  an already-due slot and the existing manual-completion race protection.
+- Reran **184 unittests: passed** (5.820 seconds), `git diff --check`: passed, and
+  `python3 tests/check_production.py`: passed (Compose merge, verified test-CA HTTPS,
+  authentication and forms). Existing tests do not cover R1's Monday transition.
+- No implementation/server changes made during review. Phase 2 must be reworked
+  and reviewed again before Phase 3; Phases 3–4 remain `Not Started`.
+
+#### R1 Rework Evidence (2026-11-21)
+
+- **R1 addressed; Ready for Review.** Added one shared eligibility calculation
+  in `refresh.py`, used by scheduler admission and dashboard status. It reconstructs
+  Monday eligibility from the persisted due time and most recent weekend, including
+  Monday after midnight, without a new schema, migration, marker file or service.
+- Added three regression tests. Friday pending → Saturday deferral → a fresh
+  process at Monday 00:01 retains Monday 14:45 eligibility. The scheduler and
+  direct scheduled admission make zero early provider calls; at Monday 14:45 they
+  make one call and advance to Tuesday. Further admission does not repeat it.
+  Custom UTC time, multiple missed weeks/year boundary, immediate ordinary weekday
+  recovery and unchanged crypto catch-up are also covered.
+- Focused refresh tests: **25 passed**. Rebuilt
+  `allstocksdatabase-phase2-check:local`; complete suite in that final image:
+  **187 tests passed** (5.756 seconds) with dummy credentials, temporary databases
+  and no external network. Existing maintenance/concurrency, crash recovery,
+  manual-completion race, persistence and security tests continued to pass.
+- `python3 tests/check_production.py` passed: production Compose merge, verified
+  isolated-CA HTTPS, authentication and sync-form protection remain intact.
+  Syntax checks and `git diff --check` passed.
+- Updated `docs/deployment.md`. Self-check found no security blocker: the change
+  only calculates an eligible timestamp from existing UTC state; file permissions,
+  locks, provider access, authentication and secret handling are unchanged.
+- No live server change or real provider request. The executor does not mark
+  review passed; Phase 2 is ready for re-review. Phases 3–4 remain `Not Started`.
+
+#### Re-review Result (2026-11-21)
+
+- **Done — Passed Review.** Reviewed the complete Phase 2 diff, new persistence/
+  coordination module, tests and documentation against scope and acceptance
+  criteria. R1 is resolved; no remaining blocking or optional findings identified.
+- Confirmed scheduler admission and displayed eligibility share `_eligible_at`.
+  The latest-weekend calculation preserves Monday's configured time after an early
+  Monday restart without schema changes. Fresh-process regression verifies zero
+  early provider calls, one call at the configured slot, and advancement to Tuesday.
+  Custom times, multiple missed weeks, ordinary weekday deployment recovery,
+  crypto recovery and manual/scheduled race protections remain covered.
+- Reran **187 unittests: passed** (6.247 seconds), using current source in the
+  isolated app image with dummy credentials, temporary data and no external network.
+  Coverage includes status persistence, failure/partial/interrupted states,
+  cross-process locks, drain timeout, helper death, pending-slot recovery and
+  absence of public maintenance controls.
+- Reran `python3 tests/check_production.py`: passed production Compose checks,
+  verified test-CA HTTPS, authentication and valid/invalid sync forms. No production
+  data, credentials or server used. Existing container-recreation evidence remains
+  applicable: R1 changes neither metadata schema/storage nor lock identities.
+- `git diff --check`, new-file syntax/whitespace checks passed. Confirmed unchanged
+  providers, requirements, base/production Compose and Caddy route. Security review
+  found no blocker in private file handling, locks, CLI-only maintenance, sanitized
+  status/errors, authentication or secret exclusions.
+- Only this plan was changed during re-review. Live deployment, actual ARM/provider
+  refresh evidence and automatic server data updates remain Phase 4 work.
+  Phase 3 is eligible when requested; Phases 3–4 remain `Not Started`.
 
 ### Phase 3: Add tested shell setup, manual update and rollback workflows
 

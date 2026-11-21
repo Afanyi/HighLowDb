@@ -140,7 +140,92 @@ touch existing app volumes or TradingSupport. The existing unittest suite also
 covers local forms, cross-browser token rejection, foreign hosts/origins, spoofed
 forwarded headers, oversized bodies and public-configuration validation.
 
-Automatic stock-data updates remain the existing weekday `SYNC_TIME_UTC` scheduler,
-with crypto at daily `CRYPTO_SYNC_TIME_UTC`. No scheduling code, schedule time or
-provider calculation has changed in this phase. Persistent refresh status and safe
-deployment draining are Phase 2; a real scheduled server refresh is Phase 4 evidence.
+Automatic stock-data updates retain the existing weekday `SYNC_TIME_UTC` schedule,
+with crypto at daily `CRYPTO_SYNC_TIME_UTC`. Phase 2 adds the persistence and
+coordination described below. A real scheduled server refresh remains Phase 4
+evidence; local tests do not establish live provider health.
+
+## Refresh status and deployment coordination
+
+`refresh.py` adds standard-library SQLite metadata and POSIX file locks, without
+another scheduler, service or dependency. `app.py` retains its two scheduler
+threads and per-dataset thread locks; both manual and scheduled jobs use the same
+provider functions. Stock/crypto tables, calculations, pacing and configured UTC
+times are unchanged.
+
+With the image's default database path, metadata is stored in
+`/data/trading212_stocks.db.refresh.db`, next to both existing data files on the
+persistent volume. It stores each dataset's last attempt/source, safe integer
+summary counts, completion time, last successful completion and next due time.
+States are `never`, `running`, `completed`, `partial`, `failed` and `interrupted`.
+A full success requires positive updated-row counts and zero failed items; partial
+or failed attempts preserve the previous success timestamp. An orphaned running
+record is marked interrupted when status is inspected and its dataset lock is
+free. A later actual attempt becomes the current record.
+
+The dashboard restores this status after restarts and compares success against the
+latest scheduled UTC slot, accounting for stock weekends. It warns about stale,
+never-refreshed or unavailable status separately from HTTP liveness. `/health`
+remains `ok` even when provider data is stale or a refresh failed. Persisted/displayed
+errors and wrapper error logs contain the failure type rather than provider
+exception text; summaries exclude tokens, symbol lists and unknown fields.
+
+On first initialization, each dataset gets its next future slot; unknown historical
+runs are not invented. Once recorded, a due slot remains pending while deployment
+holds the gate, including across a worker/container restart. It runs once after
+release and advances to the next future configured slot rather than replaying
+every missed day. A manual job begun after a due time satisfies that slot too;
+scheduled admission rechecks it under the dataset lock to avoid a duplicate call.
+Stock recovery does not add automatic weekend calls: a missed weekday slot waits
+until Monday's configured run, including after an early Monday restart. Scheduler
+admission and displayed status reconstruct this eligibility from the persisted due
+time and the latest weekend using the same calculation; no extra schema or pause
+marker is needed. Ordinary weekday recovery after a deployment delay remains
+immediate, and crypto remains daily. A worker killed mid-refresh
+cannot certify success; its pending retry can repeat provider reads from the
+interrupted attempt, while completed committed slots are not repeated.
+
+The volume also holds three stable, private lock files:
+
+- `trading212_stocks.db.refresh.gate.lock`: shared by running jobs, exclusive to
+  deployment. The exclusive lock can only be obtained after both datasets drain.
+- `trading212_stocks.db.refresh.stocks.lock` and
+  `trading212_stocks.db.refresh.crypto.lock`: prevent duplicate dataset runs across
+  processes while allowing stock and crypto to run independently.
+
+Files must be owned private regular files; symlinks, hard links and shared-mode
+files are rejected. Do not unlink/replace lock files while any worker/helper is
+running: all participants must lock the same inode. The kernel releases locks on
+descriptor/process closure, so failed helpers do not leave a permanent pause flag.
+An update can time out while jobs remain active; it must leave the live app running.
+
+Private CLI commands, run as the app user in the matching image/data environment:
+
+```sh
+python refresh.py status
+python refresh.py hold --timeout 60
+```
+
+`status` prints secret-free JSON and never imports the web app or starts a job.
+`hold` uses a bounded wait, prints `drained` after acquiring exclusive access, then
+holds it until stdin closes. It exits nonzero on timeout or unsafe state paths.
+Phase 3 must run this in a **separate helper container using the same data volume**,
+with stdin kept open (`-i`), so recreating the app does not release the helper's
+lock. Await readiness before backup/cutover; abort if the helper dies, and close
+stdin in cleanup on every success/failure path. No Docker socket is mounted in
+the application and no browser maintenance endpoint is added. The deployment
+scripts that manage this protocol are not implemented by Phase 2.
+
+Phase 2 validation built `allstocksdatabase-phase2-check:local`, ran 184 unittests
+with dummy keys and no external network, and reran the isolated HTTPS smoke test.
+Two containers were recreated against one temporary named volume with fake
+providers: both datasets, summaries, completion timestamps and next scheduled runs
+survived, and neither provider was invoked again for a future slot. The test volume
+was removed afterward. This is persistence/recovery evidence, not a live server
+deployment or a real provider refresh.
+
+R1 rework validation rebuilt the image and passed **187 unittests** (including a
+fresh-process Monday restart regression, one scheduled call at the configured
+time, custom UTC time/multiple-week backlog coverage, and unchanged weekday/crypto
+recovery). The isolated HTTPS/authentication smoke test and `git diff --check`
+also passed. No live server or provider was used for this fix.

@@ -2,6 +2,7 @@
 .env.*
 *.db
 *.db-*
+*.refresh.*.lock
 .git
 .gitignore
 .idea

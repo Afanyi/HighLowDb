@@ -11,6 +11,7 @@ deploy/releases/
 *.db-journal
 *.db-wal
 *.db-shm
+*.refresh.*.lock
 *.sqlite
 *.sqlite3
 data/

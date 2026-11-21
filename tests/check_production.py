@@ -60,7 +60,7 @@ def main():
             created_network = True
             containers.append(name + "-app")
             mounts = []
-            for source in ("app.py", "sync.py", "crypto_sync.py", "templates"):
+            for source in ("app.py", "sync.py", "crypto_sync.py", "refresh.py", "templates"):
                 mounts.extend(("--mount", f"type=bind,src={ROOT / source},dst=/app/{source},readonly"))
             run("docker", "run", "-d", "--pull=never", "--name", containers[-1], "--network", name,
                 "--network-alias", "allstocks-database-app", "--memory", "512m", "--memory-swap", "512m",
