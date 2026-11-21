@@ -1,0 +1,9 @@
+# Proposed route for the existing TradingSupport Caddyfile; not a second proxy.
+# Retains Caddy's original Host; the app does not trust forwarded headers.
+# These login variables already belong to the existing Caddy container.
+stocks.skyboyz1.duckdns.org {
+	basic_auth {
+		{$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
+	}
+	reverse_proxy allstocks-database-app:8000
+}

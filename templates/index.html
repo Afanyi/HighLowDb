@@ -44,6 +44,7 @@
       {% endif %}
     {% endif %}
     <form method="post" action="{{ url_for('sync_now' if mode == 'stocks' else 'sync_crypto_now') }}" class="d-inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="btn btn-primary btn-sm">Sync Now</button>
     </form>
   </div>

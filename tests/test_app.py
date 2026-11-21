@@ -187,8 +187,11 @@ class TestAppRoutes(unittest.TestCase):
 
     def test_post_sync_starts_background_sync_and_redirects(self):
         done = threading.Event()
+        self.client.get("/")
+        with self.client.session_transaction() as session:
+            token = session["csrf_token"]
         with patch.object(app_module.sync, "run_sync", side_effect=lambda **kw: done.set() or {}) as mock_run:
-            resp = self.client.post("/sync")
+            resp = self.client.post("/sync", data={"csrf_token": token})
             self.assertEqual(resp.status_code, 302)
             self.assertTrue(done.wait(5))
         mock_run.assert_called_once_with(db_path=self.db_path)
@@ -912,10 +915,13 @@ class TestCryptoMode(unittest.TestCase):
 
     def test_post_sync_crypto_returns_302_and_starts_crypto_job(self):
         done = threading.Event()
+        self.client.get("/?mode=crypto")
+        with self.client.session_transaction() as session:
+            token = session["csrf_token"]
         with patch.object(
             app_module.crypto_sync, "run_sync", side_effect=lambda **kw: done.set() or {}
         ) as mock_run:
-            resp = self.client.post("/sync/crypto")
+            resp = self.client.post("/sync/crypto", data={"csrf_token": token})
             self.assertEqual(resp.status_code, 302)
             self.assertTrue(done.wait(5))
         mock_run.assert_called_once_with(db_path=self.crypto_db_path)
@@ -980,6 +986,121 @@ class TestCryptoMode(unittest.TestCase):
     def test_new_this_year_status_only_in_stock_mode(self):
         self.assertNotIn("New this year</option>", self.client.get("/?mode=crypto").get_data(as_text=True))
         self.assertIn("New this year</option>", self.client.get("/").get_data(as_text=True))
+
+
+class TestRequestSecurity(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(app_module, "DB_PATH", directory + "/stocks.db"))
+        self.enterContext(patch.object(app_module, "CRYPTO_DB_PATH", directory + "/crypto.db"))
+        self.enterContext(patch.dict(app_module.app.config, app_module._security_config({})))
+        self.client = app_module.app.test_client()
+
+    def token(self, client=None):
+        client = client or self.client
+        response = client.get("/")
+        self.assertEqual(response.status_code, 200)
+        with client.session_transaction() as session:
+            token = session["csrf_token"]
+        self.assertIn(f'name="csrf_token" value="{token}"'.encode(), response.data)
+        return token
+
+    def test_valid_sync_forms_for_both_datasets(self):
+        token = self.token()
+        for path, target in (("/sync", app_module.run_sync_job),
+                             ("/sync/crypto", app_module.run_crypto_sync_job)):
+            with self.subTest(path=path), patch.object(app_module.threading, "Thread") as thread:
+                response = self.client.post(path, data={"csrf_token": token},
+                                            headers={"Origin": "http://localhost"})
+                self.assertEqual(response.status_code, 302)
+                thread.assert_called_once_with(target=target, daemon=True)
+
+    def test_missing_invalid_and_non_ascii_tokens_rejected(self):
+        self.token()
+        for path in ("/sync", "/sync/crypto"):
+            for data in ({}, {"csrf_token": "incorrect"}, {"csrf_token": "é"}):
+                with self.subTest(path=path, data=data), patch.object(app_module.threading, "Thread") as thread:
+                    self.assertEqual(self.client.post(path, data=data).status_code, 403)
+                    thread.assert_not_called()
+
+    def test_token_from_another_browser_is_rejected(self):
+        other = app_module.app.test_client()
+        self.token()
+        token = self.token(other)
+        self.assertEqual(self.client.post("/sync", data={"csrf_token": token}).status_code, 403)
+
+    def test_cross_site_requests_with_valid_tokens_are_rejected(self):
+        token = self.token()
+        for headers in ({"Origin": "https://attacker.example"}, {"Origin": "null"},
+                        {"Referer": "https://attacker.example/form"},
+                        {"Referer": "http://[malformed"}, {"Sec-Fetch-Site": "cross-site"}):
+            for path in ("/sync", "/sync/crypto"):
+                with self.subTest(path=path, headers=headers), patch.object(app_module.threading, "Thread") as thread:
+                    response = self.client.post(path, data={"csrf_token": token}, headers=headers)
+                    self.assertEqual(response.status_code, 403)
+                    thread.assert_not_called()
+
+    def test_untrusted_hosts_rejected_even_for_health(self):
+        for path in ("/", "/health", "/sync"):
+            response = self.client.get(path, headers={"Host": "attacker.example"})
+            self.assertEqual(response.status_code, 400)
+
+    def test_forwarded_headers_do_not_override_host_or_origin(self):
+        self.assertEqual(self.client.get("/health", headers={
+            "Host": "attacker.example", "X-Forwarded-Host": "localhost",
+        }).status_code, 400)
+        token = self.token()
+        self.assertEqual(self.client.post("/sync", data={"csrf_token": token}, headers={
+            "Origin": "https://localhost", "X-Forwarded-Proto": "https",
+        }).status_code, 403)
+
+    def test_health_needs_no_session_or_form_token(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"ok")
+        self.assertNotIn("Set-Cookie", response.headers)
+
+    def test_large_form_rejected_without_starting_a_job(self):
+        token = self.token()
+        with patch.object(app_module.threading, "Thread") as thread:
+            response = self.client.post("/sync", data={"csrf_token": token, "extra": "x" * 17000})
+            self.assertEqual(response.status_code, 413)
+            thread.assert_not_called()
+
+    def test_production_cookies_and_origin_behind_https_proxy(self):
+        config = app_module._security_config({
+            "APP_PUBLIC_ORIGIN": "https://stocks.example", "APP_SECRET_KEY": "test-only-" * 8,
+        })
+        with patch.dict(app_module.app.config, config):
+            client = app_module.app.test_client()
+            response = client.get("/", base_url="https://stocks.example")
+            self.assertEqual(response.status_code, 200)
+            cookie = response.headers["Set-Cookie"]
+            for value in ("__Host-allstocks_session=", "Secure", "HttpOnly", "SameSite=Strict", "Path=/"):
+                self.assertIn(value, cookie)
+            token = re.search(rb'name="csrf_token" value="([^"]+)"', response.data).group(1).decode()
+            with patch.object(app_module.threading, "Thread") as thread:
+                response = client.post("/sync", base_url="https://stocks.example",
+                                       headers={"Origin": "https://stocks.example",
+                                                "Referer": "https://stocks.example/?mode=stocks"},
+                                       data={"csrf_token": token})
+                self.assertEqual(response.status_code, 302)
+                thread.assert_called_once()
+            # A forged proxy header cannot authorize an HTTP origin.
+            response = client.post("/sync", base_url="https://stocks.example",
+                                   headers={"Origin": "http://stocks.example", "X-Forwarded-Proto": "http"},
+                                   data={"csrf_token": token})
+            self.assertEqual(response.status_code, 403)
+
+    def test_public_configuration_fails_closed(self):
+        for origin in ("http://stocks.example", "https://stocks.example/path",
+                       "https://user:password@stocks.example", "https://stocks.example:443",
+                       "https://stocks.example?query", "https://stocks.example#fragment"):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                app_module._security_config({"APP_PUBLIC_ORIGIN": origin, "APP_SECRET_KEY": "test-only-" * 8})
+        for key in ("", "short"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                app_module._security_config({"APP_PUBLIC_ORIGIN": "https://stocks.example", "APP_SECRET_KEY": key})
 
 
 if __name__ == "__main__":

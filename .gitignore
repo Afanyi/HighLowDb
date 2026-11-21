@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+deploy/server.env
+deploy/backups/
+deploy/releases/
 
 # Database and local data
 *.db

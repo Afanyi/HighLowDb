@@ -3,12 +3,14 @@ import logging
 import math
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, abort, render_template, request, redirect, session, url_for
 
 import sync
 import crypto_sync
@@ -17,6 +19,70 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+def _security_config(environ):
+    origin = environ.get("APP_PUBLIC_ORIGIN", "")
+    key = environ.get("APP_SECRET_KEY", "")
+    hosts = ["localhost", "127.0.0.1", "[::1]"]
+    if origin:
+        parts = urlsplit(origin)
+        if (parts.scheme != "https" or not parts.hostname or parts.netloc != parts.hostname
+                or parts.path or parts.query or parts.fragment
+                or not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", parts.hostname)):
+            raise ValueError("APP_PUBLIC_ORIGIN must be an HTTPS hostname without a port, path or credentials")
+        hosts.append(parts.hostname)
+        if len(key) < 32:
+            raise ValueError("APP_SECRET_KEY must contain at least 32 random characters for public access")
+    if key and len(key) < 32:
+        raise ValueError("APP_SECRET_KEY must contain at least 32 random characters")
+    return {
+        "PUBLIC_ORIGIN": origin,
+        "SECRET_KEY": key or secrets.token_hex(32),
+        "TRUSTED_HOSTS": hosts,
+        "SESSION_COOKIE_NAME": "__Host-allstocks_session" if origin else "allstocks_session",
+        "SESSION_COOKIE_SECURE": bool(origin),
+        "SESSION_COOKIE_HTTPONLY": True,
+        "SESSION_COOKIE_SAMESITE": "Strict",
+        "MAX_CONTENT_LENGTH": 16 * 1024,
+    }
+
+
+app.config.update(_security_config(os.environ))
+
+
+@app.before_request
+def protect_requests():
+    # Flask validates Host against TRUSTED_HOSTS. Forwarded headers are not trusted.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = app.config["PUBLIC_ORIGIN"] or request.host_url.rstrip("/")
+        if request.headers.get("Sec-Fetch-Site") == "cross-site":
+            abort(403)
+        if "Origin" in request.headers and request.headers["Origin"] != origin:
+            abort(403)
+        if "Referer" in request.headers:
+            try:
+                ref = urlsplit(request.headers["Referer"])
+                valid_ref = f"{ref.scheme}://{ref.netloc}" == origin
+            except ValueError:
+                valid_ref = False
+            if not valid_ref:
+                abort(403)
+        supplied = request.form.get("csrf_token", "")
+        expected = session.get("csrf_token", "")
+        if not expected or not secrets.compare_digest(supplied.encode(), expected.encode()):
+            abort(403)
+
+
+@app.after_request
+def protect_responses(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
 # The table renders ~10k rows; drop template indentation and newlines from the output.
 app.jinja_env.trim_blocks = True
 app.jinja_env.lstrip_blocks = True
@@ -393,8 +459,11 @@ def index():
     else:
         running = _sync_lock.locked()
         summary = last_summary
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
     return render_template(
         "index.html",
+        csrf_token=session["csrf_token"],
         groups=groups,
         group=group or "",
         status=status or "",
