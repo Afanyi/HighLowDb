@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    env_file: .env
+    env_file: ${APP_ENV_FILE:-.env}
     volumes:
       - data:/data
     # Localhost only: the app has no login.

@@ -2,7 +2,8 @@
 
 Phase 1 prepares production configuration and tests protected access. It does not
 install this application, modify DNS or change the live TradingSupport proxy.
-The setup/update scripts and actual rollout remain later phases in
+The manual setup/update tooling is documented in [deploy/ROLLOUT.md](../deploy/ROLLOUT.md).
+The actual rollout remains Phase 4 in
 [PLAN_deployment.md](PLAN_deployment.md).
 
 ## Inspected server, 2026-11-21
@@ -37,8 +38,9 @@ ports, networks, headroom, DNS and existing service health before any rollout.
 Merge `compose.production.yaml` after `compose.yaml`. It sets the stable project
 name `allstocks-database`, image `allstocks-database:APP_RELEASE`, data volume
 `allstocks-database_data` and network alias `allstocks-database-app`. Release
-directories must never change that volume identity. Do not override the project
-name with `-p` or `COMPOSE_PROJECT_NAME` in deployment scripts.
+directories must never change that volume identity. The deployment tool pins this
+project name explicitly; do not substitute another operator-supplied `-p` or
+`COMPOSE_PROJECT_NAME` value.
 
 The production override removes all published application ports using `!reset`
 (Compose >= 2.24) and attaches the app to the inspected existing
@@ -64,7 +66,7 @@ is still a rollout decision. No database has been moved or changed by Phase 1.
 
 Required server environment settings, in this app's private `.env` only:
 
-- `APP_RELEASE`: reviewed image/release identifier; releases are operator-run.
+- `APP_RELEASE`: set by the manual deployment tool, not included in the input environment file.
 - `APP_PUBLIC_ORIGIN=https://stocks.skyboyz1.duckdns.org`: exact HTTPS origin,
   with no path, credentials, explicit port or trailing slash.
 - `APP_SECRET_KEY`: at least 32 randomly generated characters, kept stable across
@@ -209,12 +211,16 @@ python refresh.py hold --timeout 60
 `status` prints secret-free JSON and never imports the web app or starts a job.
 `hold` uses a bounded wait, prints `drained` after acquiring exclusive access, then
 holds it until stdin closes. It exits nonzero on timeout or unsafe state paths.
-Phase 3 must run this in a **separate helper container using the same data volume**,
-with stdin kept open (`-i`), so recreating the app does not release the helper's
-lock. Await readiness before backup/cutover; abort if the helper dies, and close
-stdin in cleanup on every success/failure path. No Docker socket is mounted in
-the application and no browser maintenance endpoint is added. The deployment
-scripts that manage this protocol are not implemented by Phase 2.
+The Phase 3 deployer runs as the existing server administrator through sudo. It
+opens the same app-owned gate file through the local Docker volume's inspected
+mountpoint and holds the descriptor itself across app recreation, backup and
+recovery. Docker subprocesses inherit it while a cutover runs. This uses the same
+Phase 2 kernel lock, without depending on a separate helper's lifetime. Rootful
+Docker with a local volume driver is required; unexpected file ownership is
+rejected. The private `hold` CLI remains available for operator use in a separate
+container, with stdin kept open. Never put the gate holder inside the app being
+recreated. No Docker socket is mounted in the application and no browser
+maintenance endpoint is added.
 
 Phase 2 validation built `allstocksdatabase-phase2-check:local`, ran 184 unittests
 with dummy keys and no external network, and reran the isolated HTTPS smoke test.

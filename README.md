@@ -39,7 +39,8 @@ Tests: `docker compose run --rm app python -m unittest`
 The [deployment plan](docs/PLAN_deployment.md) targets the existing TradingSupport
 server. [Production configuration notes](docs/deployment.md) describe the private
 Compose upstream and the proposed route for its existing Caddy proxy. These files
-prepare deployment; the setup/update scripts and live rollout are later phases.
+prepare deployment. Manual setup/update scripts are documented in
+[deploy/ROLLOUT.md](deploy/ROLLOUT.md); the live rollout remains Phase 4.
 Code deployment stays manual. Automatic stock-data updates continue to use the
 existing weekday `SYNC_TIME_UTC` scheduler, independently of browser access.
 

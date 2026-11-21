@@ -507,7 +507,7 @@ deployment. Ensure test scheduler threads cannot use production keys or data.
 
 ### Phase 3: Add tested shell setup, manual update and rollback workflows
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 1, Phase 2
 
 #### Goal
@@ -581,6 +581,161 @@ candidate with temporary data and dummy credentials.
 Inspect argument quoting, target validation, SSH host verification, archive paths,
 symlink handling, secret exclusions/permissions and app-scoped cleanup. Verify
 traps/recovery cannot delete unrelated files or leave the maintenance gate active.
+
+#### Execution Evidence (2026-11-21)
+
+- Added `deploy/setup.sh` and `deploy/update.sh`, backed by standard-library-only
+  `manage.py`, `release.py` and `data.py`. Added the non-secret connection template
+  and `deploy/ROLLOUT.md`. No library, service, scheduler, provider or application
+  logic changed. Code deployment remains manually invoked; Phase 4 is not executed.
+- Releases use a fixed allowlist, per-file/archive checksums and a content-derived
+  ID. Private archives exclude real environments, keys, databases, logs and runtime
+  state. Unpacking validates all members before writing; code permissions remain
+  readable by the non-root image user inside a private staging directory.
+- The real offline dry run passed using the cached dependency image, packaged
+  current source, dummy keys, no network and temporary databases. It reads no SSH
+  configuration/key or application environment and invokes no SSH/SCP. Final
+  recorded artifact: `/tmp/allstocks-release-c_xg0k3a/review`, release
+  `a44e0d9e3374f4e1`. Later documentation/status edits do not change tested runtime
+  behavior; the next invocation packages/tests its own current release again.
+- Connection/application settings are parsed as literals, with strict SSH host
+  checking, option-safe targets, exact unique stage identity and checked helper
+  transport before extraction. No real remote connection was made in this phase.
+- Remote setup/update use the inspected fixed host/app identities and rootful
+  local Docker socket. Preflight checks resource headroom, Docker boot/version,
+  target/project/volume isolation, private paths, ingress/egress and foreign alias
+  collisions. First setup refuses existing application data. Candidate tests run
+  without production keys or the live volume on the target architecture at rollout.
+- Reused Phase 2's exact gate inode/protocol. The root deployer itself holds its
+  exclusive descriptor through snapshot/cutover/recovery, with inheritance into
+  Docker children; it does not depend on a helper surviving app recreation. This
+  needs no change to reviewed `refresh.py` and no Docker socket in the application.
+  A separate private host lock serializes deployments before building.
+- `compose.yaml` now accepts `APP_ENV_FILE` with the original `.env` default, so
+  staged releases use one stable private environment. Runtime overrides pin actual
+  image IDs and fixed project/network/data identities. Environment replacement
+  requires explicit `--env`; incompatible currency/schedule changes are refused.
+- SQLite online backups include both datasets and refresh metadata. Restore checks
+  operate only on disposable copies, checking integrity/schema/counts against both
+  candidate and actual rollback images. Schema/count changes stop before cutover.
+  Recovery restores code/image/environment and never overwrites newer live data.
+- **21 host deployment tests passed** (0.526 seconds), including mocked SSH/Docker
+  failure paths, no SSH on dry-run/local-test failure, safe literal settings and
+  extraction, private paths, file-lock cleanup/inheritance, snapshot/schema checks,
+  foreign-alias refusal, and checksums/readiness enforced even with Python `-O`.
+- `python3 tests/check_deploy_docker.py` passed its final real Docker/Compose drill:
+  initial installation, successful update, stable data/environment, corrupt-stage
+  refusal, active-job timeout leaving the app unchanged, unhealthy-cutover rollback,
+  explicit recovery after checking current data copies, and automatic gate release.
+  Both fake datasets survived; an unrelated sentinel stayed running with the same
+  container ID. Only uniquely named test resources were used/removed.
+- Offline packaged application tests passed in the dry run and candidate builds
+  (the existing 187-test application suite). `python3 tests/check_production.py`
+  passed the merged production config, verified test-CA HTTPS, authentication and
+  sync-form checks after the environment-path change. `bash -n`, source syntax/
+  whitespace checks and `git diff --check` passed.
+- Security self-check found no blocker: no raw inspect/environment output, secret
+  uploads by default, shell-sourced settings, unverified host keys, arbitrary
+  extraction paths, global prune, unrelated service stop, app socket mount or
+  automatic code deployment. No actual server file, container or provider changed.
+- Remaining: independent Phase 3 review, then separately requested Phase 4 live
+  rollout with private valid server credentials, proxy source integration and real
+  scheduled refresh evidence. Phase 4 remains `Not Started`.
+
+#### Initial Review Result (2026-11-21; resolved by rework below)
+
+- **Security blocker confirmed; Phase 3 has not passed review.** In
+  the implementation inspected at review, `deploy/manage.py`'s `local()` uploaded
+  an explicitly supplied private environment
+  at line 436 before invoking `_apply` at lines 446–447. The fixed TradingSupport
+  hostname check is only reached inside server-side `preflight()` at lines 188–190.
+  Initial setup always requires this environment upload; updates using `--env`
+  follow the same path.
+- A misconfigured `AS_HOST` pointing to another trusted SSH destination with an
+  Ubuntu home directory can therefore receive provider keys and the application
+  session secret before being rejected as the wrong server. Strict SSH host-key
+  checking authenticates the configured destination; it does not establish that
+  the destination is the intended TradingSupport host.
+- A hermetic reproduction using dummy credentials and mocked SSH/SCP confirmed
+  the order: stage created without target identity check → private environment
+  uploaded → simulated wrong-host preflight rejection. No real credentials,
+  remote connections, Docker operations or server changes were involved.
+- Required rework: verify the intended TradingSupport target before transferring
+  any private environment, preserving strict SSH verification. Add a wrong-target
+  regression proving that neither the private environment upload nor privileged
+  deployment is attempted when target verification fails.
+- Review stopped at the skill's Security Gate. Existing execution test evidence
+  above does not cover or resolve this ordering flaw; the remaining review checks
+  were not completed. Only this plan was changed during validation; no deployment
+  implementation fixes were made. Phase 4 remains `Not Started` with an unsatisfied
+  Phase 3 dependency.
+
+#### Security Rework (2026-11-21)
+
+- Resolved the credential-upload ordering blocker in `deploy/manage.py`. The
+  existing first SSH bootstrap now checks the fixed `tradingsupport-vnic`
+  hostname, actual `ubuntu` account and `/home/ubuntu` home before creating the
+  stage. A mismatch fails before any SCP or privileged deployment. The hostname
+  constant is shared with the existing privileged preflight; strict SSH host-key
+  checking and the server-side check remain enforced. No new connection or helper
+  is needed. Updated `deploy/ROLLOUT.md` with the order of these checks.
+- Added a regression in `tests/check_deploy.py` exercising the actual bootstrap
+  under optimized Python, with dummy credentials and mocked transport. For both
+  setup and explicit-environment updates, wrong host/account/home cases stop on
+  the first SSH command with no stage creation, upload or privileged operation.
+  Correct identity cases proceed through environment upload and deployment.
+  The regression failed against the original implementation and passed after
+  the fix. The existing default-update transport/checksum test also still passes.
+- `python3 -m unittest tests.check_deploy -q`: **22 tests passed**.
+  `python3 -O -m unittest tests.check_deploy -q`: **22 tests passed**.
+  `bash deploy/update.sh --dry-run`: passed packaged application tests and produced
+  release `a294ee77d638f5cc` at `/tmp/allstocks-release-jf3zbcdx/review`, without
+  reading production environments or making SSH/SCP connections. Later plan edits
+  change the next package identity, not the tested executable behavior.
+- `bash -n deploy/setup.sh deploy/update.sh` and `git diff --check` passed. The
+  correction changes only client staging checks and their tests/documentation;
+  the previous server-side Docker drill is recorded above and was not rerun for
+  this client-only fix. No real credentials, provider calls or live server changes
+  were involved. Automatic data-refresh behavior and manual-only deployment are
+  unchanged. Phase 3 is ready for a new review; Phase 4 remains `Not Started`.
+
+#### Re-review Result (2026-11-21)
+
+- **Passed review.** Confirmed Phase 1 and Phase 2 are `Done — Passed Review`.
+  Inspected the tracked diff and new deployment helpers, scripts, tests and
+  documentation against this phase's scope and acceptance criteria. The existing
+  bootstrap now rejects the wrong hostname/account/home before stage creation or
+  any upload, and the privileged host check remains. The initial security blocker
+  is resolved; no further blocking security or correctness finding was identified.
+- Reviewed explicit argument lists/remote quoting, strict SSH host-key checks,
+  literal private settings, release allowlists/checksums and extraction, fixed
+  app/project/volume/network identities, app-only cleanup, lock inheritance and
+  backup/recovery boundaries. The implementation reuses the Phase 2 kernel gate
+  and SQLite backup support, with no additional runtime dependency, public control
+  endpoint, provider change or automatic code deployment.
+- Reran `python3 -m unittest tests.check_deploy -q`: **22 tests passed**. Reran
+  the same suite with `python3 -O`: **22 tests passed**. Wrong-target cases cover
+  both first setup and explicit-environment updates, execute the real bootstrap
+  under optimization, and confirm no staging, SCP or privileged command follows
+  rejection. Existing default-environment preservation, corruption, private-path,
+  snapshot and failure checks also passed.
+- Reran `python3 tests/check_deploy_docker.py`: **passed** real isolated setup,
+  successful update, corrupt-stage rejection, active-refresh drain timeout,
+  unhealthy-candidate rollback and explicit recovery. Both fixture databases and
+  the previous environment survived; the gate released and the unrelated sentinel
+  retained its container ID and running state. The first sandboxed attempt lacked
+  Docker socket permission; the approved rerun completed successfully.
+- Reran `bash deploy/update.sh --dry-run`: **passed**, including packaged offline
+  application tests. Reviewed release `78b09d41e285222f` is at
+  `/tmp/allstocks-release-xwrwbz7w/review`. The dry run read no production
+  environment and used no SSH/SCP or live data. This review record changes the
+  next package identity without changing the tested executable behavior.
+- Reran `python3 tests/check_production.py`: **passed** stable private Compose
+  configuration, test-CA HTTPS, required authentication for both datasets/health,
+  and CSRF checks on both sync routes. Shell syntax and `git diff --check` passed.
+- Only this plan was edited during re-review. No live server connection, provider
+  request or production change was made. Phase 4 remains `Not Started`; live
+  access and real automatic stock/crypto refresh evidence are still its work.
 
 ### Phase 4: Deploy on TradingSupport and verify automatic stock refreshes
 
