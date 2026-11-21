@@ -59,6 +59,52 @@ class TestNextRun(unittest.TestCase):
             app_module._sync_lock.release()
 
 
+class TestSyncJobLogging(unittest.TestCase):
+    def test_stock_sync_logs_start_and_summary_without_lists(self):
+        summary = {"ok": 7, "no_data": 1, "failed": 1, "unmapped": 2, "failed_tickers": ["AAPL_US_EQ"],
+                   "started_at": "2026-11-14T22:00:00", "finished_at": "2026-11-15T02:00:00"}
+        with patch.object(app_module.sync, "run_sync", return_value=summary), \
+                self.assertLogs("app", level="INFO") as logs:
+            app_module.run_sync_job()
+        out = "\n".join(logs.output)
+        self.assertIn("stock sync started", out)
+        self.assertIn("stock sync finished: ok=7, no_data=1, failed=1, unmapped=2", out)
+        self.assertIn("finished_at=2026-11-15T02:00:00", out)
+        self.assertNotIn("AAPL_US_EQ", out)
+
+    def test_crypto_sync_logs_start_and_summary(self):
+        summary = {"coins": 18230, "backfilled": 200, "backfill_pending": 18030, "failed": 0, "calls": 274,
+                   "started_at": "a", "finished_at": "b"}
+        with patch.object(app_module.crypto_sync, "run_sync", return_value=summary), \
+                self.assertLogs("app", level="INFO") as logs:
+            app_module.run_crypto_sync_job()
+        out = "\n".join(logs.output)
+        self.assertIn("crypto sync started", out)
+        self.assertIn("crypto sync finished: coins=18230, backfilled=200", out)
+
+    def test_failed_sync_logs_error_with_traceback(self):
+        for job, module, name in ((app_module.run_sync_job, app_module.sync, "stock"),
+                                  (app_module.run_crypto_sync_job, app_module.crypto_sync, "crypto")):
+            with patch.object(module, "run_sync", side_effect=RuntimeError("boom")), \
+                    self.assertLogs("app", level="ERROR") as logs:
+                job()
+            out = "\n".join(logs.output)
+            self.assertIn(f"ERROR:app:{name} sync failed", out)
+            self.assertIn("Traceback", out)
+            self.assertIn("RuntimeError: boom", out)
+
+    def test_skipped_sync_logs_line(self):
+        for job, lock, name in ((app_module.run_sync_job, app_module._sync_lock, "stock"),
+                                (app_module.run_crypto_sync_job, app_module._crypto_lock, "crypto")):
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                with self.assertLogs("app", level="INFO") as logs:
+                    job()
+            finally:
+                lock.release()
+            self.assertIn(f"{name} sync skipped: already running", "\n".join(logs.output))
+
+
 class TestAppRoutes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -166,6 +212,47 @@ class TestAppRoutes(unittest.TestCase):
         filter_start = html.index('<form method="get"')
         filter_end = html.index("</form>", filter_start)
         self.assertNotIn('method="post"', html[filter_start:filter_end])
+
+    def test_type_column_rendered(self):
+        resp = self.client.get("/")
+        html = resp.get_data(as_text=True)
+        self.assertIn("Type", html)
+        self.assertIn("STOCK", html)
+
+    def test_filter_row_lines_up_with_header(self):
+        for mode in ("stocks", "crypto"):
+            html = self.client.get(f"/?mode={mode}").get_data(as_text=True)
+            header, filters = html.split("<thead")[1].split("</thead>")[0].split("<tr")[1:3]
+            cells = [sum(int(m.group(1) or 1) for m in re.finditer(r'<th(?:\s+colspan="(\d+)")?[\s>]', row))
+                     for row in (header, filters)]
+            self.assertEqual(cells[0], cells[1], mode)
+
+    def test_type_filter_stock(self):
+        resp = self.client.get("/?instrument_type=STOCK")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+
+    def test_type_filter_etf(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO stocks (ticker, name, exchange, instrument_type, status_tag, last_updated) "
+            "VALUES ('SPY_US_EQ', 'SPY ETF', 'US', 'ETF', 'ACTIVE', datetime('now'))")
+        conn.commit()
+        conn.close()
+        resp = self.client.get("/?instrument_type=ETF")
+        html = resp.get_data(as_text=True)
+        self.assertIn("SPY_US_EQ", html)
+        self.assertNotIn("AAPL_US_EQ", html)
+        resp = self.client.get("/?instrument_type=STOCK")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+        self.assertNotIn("SPY_US_EQ", html)
+
+    def test_type_filter_bad_value_ignored(self):
+        resp = self.client.get("/?instrument_type=bogus")
+        html = resp.get_data(as_text=True)
+        self.assertIn("AAPL_US_EQ", html)
+        self.assertIn('value="" selected', html)
 
     def test_summary_shown(self):
         app_module.last_summary = {
@@ -703,6 +790,196 @@ class TestHealth(unittest.TestCase):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data, b"ok")
+
+
+class TestNextRunCrypto(unittest.TestCase):
+    def test_crypto_next_run_fires_on_saturday(self):
+        # Saturday 01:00 -> next crypto run is Saturday 02:00 (weekends are NOT skipped).
+        saturday = datetime(2026, 1, 10, 1, 0, tzinfo=timezone.utc)
+        nr = app_module.next_run(now=saturday, hh=2, mm=0, weekdays_only=False)
+        self.assertEqual(nr.weekday(), 5)
+        self.assertEqual(nr.hour, 2)
+        self.assertEqual(nr.minute, 0)
+
+    def test_crypto_next_run_fires_on_sunday(self):
+        # Sunday 01:00 -> next crypto run is Sunday 02:00.
+        sunday = datetime(2026, 1, 11, 1, 0, tzinfo=timezone.utc)
+        nr = app_module.next_run(now=sunday, hh=2, mm=0, weekdays_only=False)
+        self.assertEqual(nr.weekday(), 6)
+        self.assertEqual(nr.hour, 2)
+        self.assertEqual(nr.minute, 0)
+
+    def test_crypto_next_run_still_respects_time_after_midnight(self):
+        # Monday 01:00 -> next crypto run is Monday 02:00
+        monday = datetime(2026, 1, 12, 1, 0, tzinfo=timezone.utc)
+        nr = app_module.next_run(now=monday, hh=2, mm=0, weekdays_only=False)
+        self.assertEqual(nr.weekday(), 0)
+        self.assertEqual(nr.hour, 2)
+
+
+class TestCryptoMode(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+        self.crypto_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.crypto_tmp.close()
+        self.crypto_db_path = self.crypto_tmp.name
+        app_module.DB_PATH = self.db_path
+        app_module.CRYPTO_DB_PATH = self.crypto_db_path
+        app_module.last_summary = None
+        app_module.last_crypto_summary = None
+
+        import sync as sync_mod
+        sync_mod.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.executemany(
+            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "all_time_max, all_time_min, status_tag, last_updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            [
+                ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
+                ("BPl_EQ", "BP plc", "LSE", 5.0, 6.0, 4.0, 7.0, 3.0, "ACTIVE"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        import crypto_sync as crypto_sync_mod
+        crypto_sync_mod.init_db(self.crypto_db_path)
+        conn = sqlite3.connect(self.crypto_db_path)
+        conn.executemany(
+            "INSERT INTO crypto (ticker, symbol, name, market_cap_rank, opening_price, "
+            "year_max, year_min, all_time_max, all_time_min, status_tag, last_updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            [
+                ("bitcoin", "btc", "Bitcoin", 1, 100000.0, 110000.0, 90000.0, 120000.0, 80000.0, "ACTIVE"),
+                ("pepe", "pepe", "Pepe", 1500, 0.0000035, 0.000004, 0.000003, 0.000005, 0.000002, "ACTIVE"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        self.client = app_module.app.test_client()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+        os.unlink(self.crypto_db_path)
+        app_module.DB_PATH = "trading212_stocks.db"
+        app_module.CRYPTO_DB_PATH = "crypto.db"
+
+    def test_mode_stock_renders_stocks(self):
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"AAPL_US_EQ", resp.data)
+
+    def test_mode_stocks_explicit_renders_stocks(self):
+        resp = self.client.get("/?mode=stocks")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"AAPL_US_EQ", resp.data)
+
+    def test_mode_crypto_renders_coins(self):
+        resp = self.client.get("/?mode=crypto")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"btc", resp.data)
+        self.assertIn(b"Bitcoin", resp.data)
+        self.assertIn(b"Pepe", resp.data)
+        self.assertNotIn(b"AAPL_US_EQ", resp.data)
+
+    def test_invalid_mode_falls_back_to_stocks(self):
+        resp = self.client.get("/?mode=foo")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"AAPL_US_EQ", resp.data)
+        self.assertNotIn(b"bitcoin", resp.data)
+
+    def test_crypto_distance_filter_both_ends_included(self):
+        # bitcoin is 16.67 % below its ATH (between 0 and 20), pepe is 30 % (excluded).
+        resp = self.client.get("/?mode=crypto&min_pct_all_time_max=0&max_pct_all_time_max=20")
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        self.assertIn("Bitcoin", html)
+        self.assertNotIn("pepe", html)
+
+    def test_header_links_keep_mode_crypto(self):
+        resp = self.client.get("/?mode=crypto")
+        html = resp.get_data(as_text=True)
+        self.assertIn("mode=crypto", html)
+
+    def test_apply_keeps_mode_crypto(self):
+        resp = self.client.get("/?mode=crypto&q=bitcoin")
+        html = resp.get_data(as_text=True)
+        self.assertIn("mode=crypto", html)
+
+    def test_post_sync_crypto_returns_302_and_starts_crypto_job(self):
+        done = threading.Event()
+        with patch.object(
+            app_module.crypto_sync, "run_sync", side_effect=lambda **kw: done.set() or {}
+        ) as mock_run:
+            resp = self.client.post("/sync/crypto")
+            self.assertEqual(resp.status_code, 302)
+            self.assertTrue(done.wait(5))
+        mock_run.assert_called_once_with(db_path=self.crypto_db_path)
+
+    def test_locks_are_independent(self):
+        with patch.object(app_module.crypto_sync, "run_sync", return_value={}) as mock_crypto:
+            app_module._sync_lock.acquire(blocking=False)
+            app_module.run_crypto_sync_job()
+            mock_crypto.assert_called_once_with(db_path=self.crypto_db_path)
+            app_module._sync_lock.release()
+
+        with patch.object(app_module.sync, "run_sync", return_value={}) as mock_stock:
+            app_module._crypto_lock.acquire(blocking=False)
+            app_module.run_sync_job()
+            mock_stock.assert_called_once_with(db_path=self.db_path)
+            app_module._crypto_lock.release()
+
+    def test_crypto_shows_attribution_and_no_script(self):
+        resp = self.client.get("/?mode=crypto")
+        html = resp.get_data(as_text=True)
+        self.assertIn("CoinGecko", html)
+        self.assertIn("coingecko.com", html)
+        self.assertIn('rel="noopener"', html)
+        self.assertNotIn("<script", html)
+
+    def test_tiny_crypto_price_not_zero(self):
+        resp = self.client.get("/?mode=crypto")
+        html = resp.get_data(as_text=True)
+        self.assertIn("3.5e-06", html)
+
+    def test_crypto_search_matches_symbol(self):
+        # "btc" is in neither the CoinGecko id "bitcoin" nor the name "Bitcoin", only the symbol.
+        html = self.client.get("/?mode=crypto&q=BTC").get_data(as_text=True)
+        self.assertIn("Bitcoin", html)
+        self.assertNotIn("Pepe", html)
+
+    def test_stock_search_still_matches_ticker_and_name(self):
+        self.assertIn(b"AAPL_US_EQ", self.client.get("/?q=Apple").data)
+        self.assertIn(b"BPl_EQ", self.client.get("/?q=BPl").data)
+        self.assertNotIn(b"BPl_EQ", self.client.get("/?q=Apple").data)
+
+    def test_crypto_default_order_is_rank_with_unranked_last(self):
+        conn = sqlite3.connect(self.crypto_db_path)
+        conn.execute(
+            "INSERT INTO crypto (ticker, symbol, name, market_cap_rank, opening_price, status_tag, last_updated) "
+            "VALUES ('aaa-unranked', 'aaa', 'Aaa Unranked', NULL, 1.0, 'ACTIVE', datetime('now'))"
+        )
+        conn.commit()
+        conn.close()
+        html = self.client.get("/?mode=crypto").get_data(as_text=True)
+        self.assertLess(html.index("Bitcoin"), html.index("Pepe"))
+        self.assertLess(html.index("Pepe"), html.index("Aaa Unranked"))
+        self.assertIn('value="market_cap_rank" selected', html)
+
+    def test_search_label_follows_mode(self):
+        self.assertIn('aria-label="Search symbol or name"', self.client.get("/?mode=crypto").get_data(as_text=True))
+        self.assertIn('aria-label="Search ticker or name"', self.client.get("/").get_data(as_text=True))
+
+    def test_crypto_mode_no_type_filter(self):
+        self.assertNotIn('name="instrument_type"', self.client.get("/?mode=crypto").get_data(as_text=True))
+
+    def test_new_this_year_status_only_in_stock_mode(self):
+        self.assertNotIn("New this year</option>", self.client.get("/?mode=crypto").get_data(as_text=True))
+        self.assertIn("New this year</option>", self.client.get("/").get_data(as_text=True))
 
 
 if __name__ == "__main__":

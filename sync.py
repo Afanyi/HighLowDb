@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 import time
 import warnings
@@ -9,6 +10,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
+from yfinance.utils import get_ticker_by_isin
 
 log = logging.getLogger(__name__)
 # yfinance calls deprecated pandas inplace APIs on every download; keep that out of the logs.
@@ -50,6 +52,7 @@ COUNTRY_CODES = {
 EXCHANGE_LETTERS = {
     "l": (".L", "LSE"),
     "d": (".F", "FRANKFURT"),
+    "m": (".MI", "MILAN"),
     "p": (".PA", "PARIS"),
     "e": (".MC", "MADRID"),
     "s": (".SW", "SIX"),
@@ -69,7 +72,11 @@ EXCHANGE_COUNTRIES = {
     "MADRID": "Spain",
     "SIX": "Switzerland",
     "AMSTERDAM": "Netherlands",
+    "MILAN": "Italy",
 }
+
+# A Yahoo symbol accepted from an ISIN lookup: uppercase, dots/dashes/caret/equals allowed.
+ISIN_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.\-^=]{1,20}$")
 
 
 def init_db(db_path: str = DB_PATH) -> None:
@@ -87,9 +94,23 @@ def init_db(db_path: str = DB_PATH) -> None:
                 all_time_max REAL,
                 all_time_min REAL,
                 status_tag TEXT,
-                last_updated TEXT
+                last_updated TEXT,
+                instrument_type TEXT NOT NULL DEFAULT 'STOCK'
             )
-        """
+            """
+        )
+        # Migrate a DB that predates the instrument_type column; existing rows become STOCK.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(stocks)")}
+        if "instrument_type" not in cols:
+            conn.execute("ALTER TABLE stocks ADD COLUMN instrument_type TEXT NOT NULL DEFAULT 'STOCK'")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS yahoo_symbols (
+                ticker TEXT PRIMARY KEY,
+                yahoo_symbol TEXT NOT NULL,
+                resolved_at TEXT NOT NULL
+            )
+            """
         )
         conn.commit()
     finally:
@@ -206,13 +227,38 @@ class _Yahoo:
             hist = hist.dropna(how="all")
             return None if hist.empty else hist
 
+    def isin_to_symbol(self, isin: str) -> str | None:
+        """Resolve an ISIN to a Yahoo symbol, with the same pacing and back-off as history().
 
-def _upsert(cursor, inst: dict, exchange: str, metrics: dict) -> None:
+        Returns None when Yahoo has no match or the ISIN is invalid; a failed lookup never
+        crashes the sync.
+        """
+        attempts = 0
+        while True:
+            time.sleep(REQUEST_DELAY)
+            try:
+                return get_ticker_by_isin(isin) or None
+            except YFRateLimitError:
+                log.warning("Yahoo rate limit hit; waiting %ds before ISIN lookup %s", self.backoff, isin)
+                time.sleep(self.backoff)
+                self.backoff = min(self.backoff * 2, MAX_RATE_LIMIT_BACKOFF)
+                continue
+            except (YFTickerMissingError, ValueError):
+                return None
+            except Exception:
+                attempts += 1
+                if attempts >= MAX_ATTEMPTS:
+                    return None
+                time.sleep(2 ** attempts)
+                continue
+
+
+def _upsert(cursor, inst: dict, exchange: str, metrics: dict, instrument_type: str) -> None:
     cursor.execute(
         """
         INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min,
-                            all_time_max, all_time_min, status_tag, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                            all_time_max, all_time_min, status_tag, last_updated, instrument_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
         ON CONFLICT(ticker) DO UPDATE SET
             name=excluded.name,
             exchange=excluded.exchange,
@@ -222,7 +268,8 @@ def _upsert(cursor, inst: dict, exchange: str, metrics: dict) -> None:
             all_time_max=excluded.all_time_max,
             all_time_min=excluded.all_time_min,
             status_tag=excluded.status_tag,
-            last_updated=datetime('now')
+            last_updated=datetime('now'),
+            instrument_type=excluded.instrument_type
         """,
         (
             inst["ticker"],
@@ -234,64 +281,126 @@ def _upsert(cursor, inst: dict, exchange: str, metrics: dict) -> None:
             metrics["all_time_max"],
             metrics["all_time_min"],
             metrics["status_tag"],
+            instrument_type,
         ),
     )
+
+
+def _exchange_for_symbol(symbol: str) -> str | None:
+    """Reverse-map a Yahoo symbol suffix to its exchange; None for an unknown suffix.
+
+    A symbol without a suffix is a plain US ticker.
+    """
+    for suffix, exchange in list(COUNTRY_CODES.values()) + list(EXCHANGE_LETTERS.values()):
+        if suffix and symbol.endswith(suffix):
+            return exchange
+    return "US" if "." not in symbol else None
+
+
+def _isin_acceptable(sym: str | None, expected: str | None) -> str | None:
+    """Return the exchange for an ISIN-resolved symbol if it may be used, else None.
+
+    A mapped instrument only accepts a symbol on its expected exchange; an unmapped
+    instrument accepts any known suffix.
+    """
+    if not sym or not ISIN_SYMBOL_PATTERN.match(sym):
+        return None
+    exch = _exchange_for_symbol(sym)
+    if expected is not None and exch != expected:
+        return None
+    return exch
+
+
+def _save_symbol(conn, ticker: str, symbol: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO yahoo_symbols (ticker, yahoo_symbol, resolved_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(ticker) DO UPDATE SET
+            yahoo_symbol=excluded.yahoo_symbol,
+            resolved_at=datetime('now')
+        """,
+        (ticker, symbol),
+    )
+    conn.commit()
 
 
 def run_sync(db_path: str = DB_PATH) -> dict:
     """Fetch T212 instruments, map to Yahoo, download metrics, upsert into SQLite.
 
+    STOCK and ETF instruments are kept; warrants are skipped. A saved ISIN match is used
+    first; otherwise the symbol comes from the T212 ticker or, for unmappable tickers, from
+    an ISIN lookup. A symbol with no data is retried once through the ISIN. An ISIN match is
+    saved only once Yahoo returned prices for it, and a saved match without data is dropped.
+
     Returns a summary dict with counts and timestamps: ok, no_data (Yahoo has no prices for
-    the symbol), failed (still erroring after every retry pass, listed in failed_tickers)
-    and unmapped (no Yahoo symbol).
+    the symbol), failed (still erroring after every retry pass, listed in failed_tickers),
+    unmapped (no Yahoo mapping and no ISIN match) and resolved_by_isin (instruments newly
+    matched through their ISIN this run). ok + no_data + failed equals the number of
+    instruments that had a Yahoo symbol to try.
     """
     init_db(db_path)
     instruments = fetch_instruments()
 
-    stock_instruments = [i for i in instruments if i.get("type") == "STOCK"]
-
-    yahoo_map: dict[str, tuple[dict, str]] = {}
-    unmapped_count = 0
-    for inst in stock_instruments:
-        mapped = to_yahoo(inst["ticker"])
-        if mapped:
-            yahoo, exchange = mapped
-            yahoo_map[yahoo] = (inst, exchange)
-        else:
-            unmapped_count += 1
-
-    summary = {
-        "ok": 0,
-        "no_data": 0,
-        "failed": 0,
-        "unmapped": unmapped_count,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
+    keep = [i for i in instruments if i.get("type") in ("STOCK", "ETF")]
 
     yahoo = _Yahoo()
-    pending = list(yahoo_map.keys())
     conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
         current_year = datetime.now().year
 
+        saved = dict(conn.execute("SELECT ticker, yahoo_symbol FROM yahoo_symbols").fetchall())
+
+        # T212 ticker -> [instrument, yahoo symbol, exchange, source, expected exchange].
+        # Keyed by T212 ticker, so two instruments sharing one Yahoo symbol both get a row.
+        # source: "mapped" (from the ticker), "saved" (yahoo_symbols) or "isin" (new match).
+        work: dict[str, list] = {}
+        isin_tried: set[str] = set()
+        unmapped_count = 0
+        for inst in keep:
+            ticker = inst["ticker"]
+            mapped = to_yahoo(ticker)
+            expected = mapped[1] if mapped else None
+            saved_sym = saved.get(ticker)
+            saved_exchange = _isin_acceptable(saved_sym, expected)
+            if saved_exchange:
+                work[ticker] = [inst, saved_sym, saved_exchange, "saved", expected]
+            elif mapped:
+                work[ticker] = [inst, mapped[0], mapped[1], "mapped", expected]
+            else:
+                isin_tried.add(ticker)
+                sym = _resolve_isin(yahoo, inst, None)
+                if sym:
+                    work[ticker] = [inst, sym[0], sym[1], "isin", None]
+                else:
+                    unmapped_count += 1
+
+        summary = {
+            "ok": 0,
+            "no_data": 0,
+            "failed": 0,
+            "unmapped": unmapped_count,
+            "resolved_by_isin": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        pending = list(work)
         for sync_pass in range(RETRY_PASSES + 1):
             if sync_pass:
                 log.info("Retry pass %d: %d tickers, after %ds", sync_pass, len(pending), RETRY_PASS_PAUSE)
                 time.sleep(RETRY_PASS_PAUSE)
             errored = []
-            for n, symbol in enumerate(pending, 1):
-                inst, exchange = yahoo_map[symbol]
+            for n, ticker in enumerate(pending, 1):
                 try:
-                    hist = yahoo.history(symbol)
-                    if hist is None:
-                        summary["no_data"] += 1
-                        continue
-                    _upsert(cursor, inst, exchange, compute_metrics(hist, current_year))
-                    summary["ok"] += 1
-                except Exception as exc:
-                    log.warning("%s failed: %r", symbol, exc)
-                    errored.append(symbol)
+                    result = _sync_one(yahoo, conn, cursor, work[ticker], isin_tried, current_year)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s failed: %r", work[ticker][1], exc)
+                    errored.append(ticker)
+                else:
+                    summary[result] += 1
+                    if result == "ok" and work[ticker][3] == "isin":
+                        summary["resolved_by_isin"] += 1
                 if n % 100 == 0:
                     conn.commit()
                     log.info("Sync pass %d: %d/%d done", sync_pass, n, len(pending))
@@ -303,6 +412,43 @@ def run_sync(db_path: str = DB_PATH) -> dict:
         conn.close()
 
     summary["failed"] = len(pending)
-    summary["failed_tickers"] = [yahoo_map[s][0]["ticker"] for s in pending]
+    summary["failed_tickers"] = pending
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
     return summary
+
+
+def _resolve_isin(yahoo: _Yahoo, inst: dict, expected: str | None) -> tuple[str, str] | None:
+    """Look up the instrument's ISIN; (symbol, exchange) if the match may be used, else None."""
+    isin = inst.get("isin")
+    if not isin:
+        return None
+    sym = yahoo.isin_to_symbol(isin)
+    exchange = _isin_acceptable(sym, expected)
+    if sym and exchange is None:
+        log.info("ISIN match rejected for %s: %r", inst["ticker"], sym)
+    return (sym, exchange) if exchange else None
+
+
+def _sync_one(yahoo: _Yahoo, conn, cursor, entry: list, isin_tried: set, current_year: int) -> str:
+    """Sync one instrument; returns "ok" or "no_data", raises on errors (retried later).
+
+    entry is updated in place, so a retry pass reuses an ISIN match found earlier.
+    """
+    inst, symbol, exchange, source, expected = entry
+    ticker = inst["ticker"]
+    hist = yahoo.history(symbol)
+    if hist is None and source == "saved":
+        conn.execute("DELETE FROM yahoo_symbols WHERE ticker=?", (ticker,))
+    if hist is None and ticker not in isin_tried:
+        isin_tried.add(ticker)
+        match = _resolve_isin(yahoo, inst, expected)
+        if match and match[0] != symbol:
+            entry[1:4] = [match[0], match[1], "isin"]
+            symbol, exchange = match
+            hist = yahoo.history(symbol)
+    if hist is None:
+        return "no_data"
+    if entry[3] == "isin":
+        _save_symbol(conn, ticker, symbol)
+    _upsert(cursor, inst, exchange, compute_metrics(hist, current_year), inst.get("type", "STOCK"))
+    return "ok"

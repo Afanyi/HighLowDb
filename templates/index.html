@@ -18,21 +18,32 @@
 </style>
 </head>
 <body class="container-fluid py-3">
-{% macro fmt(value, pct=False) -%}
-{% if value is none %}<span class="text-body-secondary">—</span>{% elif pct %}{{ "%.1f%%" % value }}{% else %}{{ "%.2f" % value }}{% endif %}
+{% macro fmt(value, pct=False, crypto=False) -%}
+{% if value is none %}<span class="text-body-secondary">—</span>{% elif pct %}{{ "%.1f%%" % value }}{% else %}{{ "%.6g" % value if crypto else "%.2f" % value }}{% endif %}
 {%- endmacro %}
 
 <nav class="navbar navbar-expand-lg bg-body-tertiary mb-3 border-bottom">
   <span class="navbar-brand">Trading 212 Stocks</span>
   <div class="d-flex align-items-center">
+    {% if mode == "crypto" %}
+      <a href="{{ url_for('index', mode='stocks', **nav_filters) }}" class="btn btn-outline-secondary btn-sm me-1">Stocks</a>
+      <a href="{{ url_for('index', mode='crypto', **nav_filters) }}" class="btn btn-primary btn-sm me-2">Crypto</a>
+    {% else %}
+      <a href="{{ url_for('index', mode='stocks', **nav_filters) }}" class="btn btn-primary btn-sm me-1">Stocks</a>
+      <a href="{{ url_for('index', mode='crypto', **nav_filters) }}" class="btn btn-outline-secondary btn-sm me-2">Crypto</a>
+    {% endif %}
     {% if running %}
       <span class="badge text-bg-warning me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Sync running…</span>
     {% elif summary and summary.error %}
       <span class="badge text-bg-danger me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Error: {{ summary.error }}</span>
     {% elif summary %}
-      <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, No data: {{ summary.no_data }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
+      {% if mode == "crypto" %}
+        <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.coins }} coins, Backfilled: {{ summary.backfilled }}, Failed: {{ summary.failed }}</span>
+      {% else %}
+        <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, No data: {{ summary.no_data }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
+      {% endif %}
     {% endif %}
-    <form method="post" action="{{ url_for('sync_now') }}" class="d-inline">
+    <form method="post" action="{{ url_for('sync_now' if mode == 'stocks' else 'sync_crypto_now') }}" class="d-inline">
       <button type="submit" class="btn btn-primary btn-sm">Sync Now</button>
     </form>
   </div>
@@ -68,6 +79,7 @@
 <div class="card mb-3">
   <div class="card-body">
     <form method="get" action="{{ url_for('index') }}" id="filters">
+      <input type="hidden" name="mode" value="{{ mode }}">
       <p class="small text-body-secondary mb-2">Filter in the row under the column headers, then press Enter or Apply. Percent ranges include both ends (min ≤ x ≤ max).</p>
       <div class="row g-2 align-items-end">
         {% for i in range(3) %}
@@ -133,9 +145,10 @@
         </tr>
         <tr class="filters">
           <th colspan="2">
-            <input type="search" name="q" form="filters" value="{{ q }}" placeholder="Ticker or name" aria-label="Search ticker or name"
+            <input type="search" name="q" form="filters" value="{{ q }}" placeholder="{{ 'Symbol or name' if mode == 'crypto' else 'Ticker or name' }}" aria-label="{{ 'Search symbol or name' if mode == 'crypto' else 'Search ticker or name' }}"
                    class="form-control form-control-sm{% if q %} active-filter{% endif %}">
           </th>
+          {% if mode != "crypto" %}
           <th>
             <select name="country" form="filters" aria-label="Country" class="form-select form-select-sm{% if country %} active-filter{% endif %}">
               <option value="" {% if not country %}selected{% endif %}>All countries</option>
@@ -144,12 +157,22 @@
               {% endfor %}
             </select>
           </th>
+          <th>
+            <select name="instrument_type" form="filters" aria-label="Type" class="form-select form-select-sm{% if instrument_type %} active-filter{% endif %}">
+              <option value="" {% if not instrument_type %}selected{% endif %}>All types</option>
+              <option value="STOCK" {% if instrument_type == "STOCK" %}selected{% endif %}>Stock</option>
+              <option value="ETF" {% if instrument_type == "ETF" %}selected{% endif %}>ETF</option>
+            </select>
+          </th>
           <th colspan="5"></th>
+          {% else %}
+          <th colspan="6"></th>
+          {% endif %}
           <th>
             <select name="status" form="filters" aria-label="Status" class="form-select form-select-sm{% if status %} active-filter{% endif %}">
               <option value="" {% if not status %}selected{% endif %}>All</option>
               <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
-              <option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>
+              {% if mode != "crypto" %}<option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>{% endif %}
               <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
             </select>
           </th>
@@ -183,8 +206,13 @@
       {% for row in g_rows %}
       {% set st = row["status_tag"] %}
 {# Rows are written without indentation: ~10k rows make every byte count. #}
-<tr><td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td>
-{%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key]) }}</td>{% endfor -%}
+<tr>
+{% if mode == "crypto" %}
+  <td>{{ row["market_cap_rank"] or "—" }}</td><td>{{ row["symbol"] or "—" }}</td><td>{{ row["name"] or "—" }}</td>
+{% else %}
+  <td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td><td>{{ row["instrument_type"] or "—" }}</td>
+{% endif %}
+{%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key], crypto=(mode == "crypto")) }}</td>{% endfor -%}
 <td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>
 {%- for key in distance_labels %}<td class="text-end">{{ fmt(row[key], pct=True) }}</td>{% endfor %}</tr>
       {% endfor %}
@@ -193,6 +221,10 @@
     </table>
   </div>
 </div>
+
+{% if mode == "crypto" %}
+<p class="text-body-secondary small">Crypto data provided by <a href="https://www.coingecko.com" rel="noopener" target="_blank">CoinGecko</a>.</p>
+{% endif %}
 
 <p class="text-body-secondary">{{ shown }} row(s) shown.</p>
 
