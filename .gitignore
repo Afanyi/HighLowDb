@@ -15,6 +15,7 @@ deploy/releases/
 *.sqlite
 *.sqlite3
 data/
+docs/stocks_export_2026-11-22.csv
 
 # Python
 __pycache__/

@@ -4,7 +4,7 @@ Phase 1 prepares production configuration and tests protected access. It does no
 install this application, modify DNS or change the live TradingSupport proxy.
 The manual setup/update tooling is documented in [deploy/ROLLOUT.md](../deploy/ROLLOUT.md).
 The actual rollout remains Phase 4 in
-[PLAN_deployment.md](PLAN_deployment.md).
+[PLAN_deployment.md](done/PLAN_deployment.md).
 
 ## Inspected server, 2026-11-21
 

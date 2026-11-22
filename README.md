@@ -36,7 +36,7 @@ Tests: `docker compose run --rm app python -m unittest`
 
 ## Server deployment preparation
 
-The [deployment plan](docs/PLAN_deployment.md) targets the existing TradingSupport
+The [deployment plan](docs/done/PLAN_deployment.md) targets the existing TradingSupport
 server. [Production configuration notes](docs/deployment.md) describe the private
 Compose upstream and the proposed route for its existing Caddy proxy. These files
 prepare deployment. Manual setup/update scripts are documented in
