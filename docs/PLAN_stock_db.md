@@ -2,16 +2,18 @@
 
 ## 1. Goal
 
-Turn the existing stock dashboard into a small, correct, manually refreshed list of the
-**1,000 most volatile eligible Trading 212 stocks across 23 developed markets**.
+Turn the existing stock dashboard into a small, correct, manually refreshed list of **up to
+1,000 of the most volatile eligible Trading 212 stocks across 23 developed markets**. Seats stay
+empty when not enough stocks are eligible.
 
-For each selected stock, store only:
+For each selected stock, the only market values stored are:
 
 - all-time max and min;
-- current price, with its price date;
+- current price, defined as the latest valid close, with its price date;
 - calendar-year max and min, if available.
 
-A missing value is better than a wrong value.
+Identity, selection and quality fields listed under "Data changes" may also be stored. A missing
+value is better than a wrong value.
 
 ## 2. Non-Goals
 
@@ -40,6 +42,8 @@ A missing value is better than a wrong value.
   records why it is unavoidable.
 - Each phase ends with passing checks, a summary and owner approval. No commit or push unless
   the owner asks.
+- Do not press or run a live stock sync before Phase 5. The current sync still uses the old
+  all-stock calculation.
 
 ## 4. Current Understanding
 
@@ -55,9 +59,14 @@ A missing value is better than a wrong value.
   similar markets appear through foreign lines, so **country is the ISIN prefix**.
 - Issuers with ISIN prefixes such as KY, BM, VG, JE and GG are outside the 23 countries unless a
   later reviewed rule maps them.
-- The live app still runs release `79623e5c930fd942` and **its automatic stock scheduler is still
-  active**. The next run is 2026-11-23 at 14:45 UTC. The local removal is not deployed because
-  the session's permission system blocked `deploy/update.sh`.
+- The live app runs release `c9bad96e9fd67e20`. **Its automatic stock scheduler is removed**; crypto
+  remains scheduled. The change is committed as `bc0bad4`.
+- `deploy/manage.py` allows only known app environment keys. Its update flow stops on schema or
+  row-count changes, so Phase 5 needs a reviewed migration.
+- `deploy/release.py` ships an explicit file list. Any new runtime module must be added to it and
+  to the `Dockerfile`.
+- README, `.env.example`, `deploy/ROLLOUT.md` and `docs/deployment.md` still describe automatic or
+  all-stock behavior. This plan wins until Phase 5 updates them.
 - The server has 1 CPU, 1.9 GB RAM and about 33 GB free disk, shared with TradingSupport.
 - WallStreetOdds is US-only and its terms on automated storage are unclear. EODHD's free plan has
   no stock all-time fields. Neither is part of this plan.
@@ -74,7 +83,8 @@ A missing value is better than a wrong value.
 
 ### Unknown — inspect before implementation
 
-Live Trading 212 list and quotas; Yahoo fields and throttling for the selected size; whether
+Live Trading 212 list and quotas (Phase 1 requires a live read-only key in `T212_API_KEY`,
+`T212_API_SECRET` and `T212_ENVIRONMENT=live`); Yahoo fields and throttling for the selected size; whether
 each quota can fill after filters; FX source and terms; current Massive and Alpha Vantage terms
 and non-US coverage; how yfinance's split-adjusted values behave for serial reverse splits.
 
@@ -88,9 +98,10 @@ and non-US coverage; how yfinance's split-adjusted values behave for serial reve
 
 ### Target flow
 
-1. **Monthly, manual selection:** fetch instruments, filter, score and save 1,000 members.
-2. **About twice weekly, manual sync:** for members only, fetch history, validate, calculate the
-   five values, save them and discard history.
+1. **Monthly, manual selection:** fetch instruments, filter, score and propose up to 1,000 members.
+2. **About twice weekly, manual sync:** for approved members only, fetch history, validate, calculate
+   the five values, save them and discard history. With no approved members, the sync refuses to
+   call Yahoo.
 3. **Manual validation:** compare a rotating sample with independent providers.
 
 At 0.5 s pacing a member sync needs about 8–10 minutes. Selection is the larger Yahoo job because
@@ -100,8 +111,11 @@ it needs 63 sessions for each eligible candidate.
 
 Use the square root of MSCI ACWI IMI developed-market weights at
 [30 June 2026](https://www.msci.com/downloads/web/msci-com/research-and-insights/video/acwi-imi-complete-geographic-breakdown/oct-2026/A%20Complete%20Geographic%20Breakdown%20of%20the%20MSCI%20ACWI%20IMI.pdf),
-with the owner's US maximum of 200 and minimum of 10 per country. Quotas are ceilings. Empty seats
-stay empty rather than admitting weak stocks. Recalculate from the live ISIN counts in Phase 1.
+with the owner's US maximum of 200 and target minimum of 10 per country. Other countries are capped
+at 15% of the total and 75% of their unique ISINs, except that the owner's minimum of 10 overrides
+the 75% limit where supply allows. Quotas are ceilings. A country may be below 10 only because of
+too little supply or too few stocks passing the gates; empty seats stay empty rather than admitting
+weak stocks. Recalculate from the live ISIN counts in Phase 1 using this same rule.
 
 ```python
 COUNTRY_QUOTAS = {
@@ -114,19 +128,27 @@ COUNTRY_QUOTAS = {
 ### Selection rule (starting values, calibrate on real data)
 
 - Keep `type == "STOCK"` and one line per ISIN, choosing the highest median EUR traded value.
+  Convert traded value with a source approved in Phase 1. Missing FX means the stock is ineligible.
+- A new listing needs 68 sessions: skip its first 5, then use the next 63.
 - Over 63 sessions, require at least 57 valid sessions, median traded value of at least €1m,
   at least 90% trading days, at most 6 zero-volume days, at most 20% zero-return days and a
   price of at least about $2. Current members use €0.75m, 85%, 9, 25% and $1.50.
 - Exclude a stock with invalid OHLC, high/low of at least 3, or an unexplained split-like jump.
 - Rank each country by RYZ63, a Yang-Zhang volatility with daily components clipped at
-  median ± 6 scaled MAD. Fill new seats from the top of the country's quota. Keep a current member
-  while it ranks within 1.3 × that quota.
+  median ± 6 scaled MAD. Retain eligible current members ranked within 1.3 × the country's quota,
+  best first, then fill remaining seats by rank. Retained members count toward the quota, which is
+  never exceeded. The first selection has no current members.
 
 ### Data changes
 
 Extend the existing migration pattern in `sync.init_db`. Add to `stocks`: `current_price`,
 `price_date`, `isin`, `country`, `verification`, `quality_flags`. Add `universe_members`:
-`ticker`, `isin`, `country`, `rank`, `volatility`, `selected_at`. No history table.
+`ticker`, `isin`, `country`, `rank`, `volatility`, `selected_at`. It holds approved members only;
+proposals stay in the private review file. No history table.
+
+`current_price` replaces `opening_price` in dashboard values and distance calculations. Existing
+columns remain until the Phase 5 reviewed migration. Existing non-member rows are removed from
+the live table only in Phase 5, after backup and owner approval.
 
 Verification values: `SINGLE_SOURCE`, `CONSISTENT`, `DISAGREES`. Agreement means consistency,
 not proof.
@@ -135,18 +157,21 @@ not proof.
 
 Every member must satisfy, when values exist:
 `0 < all_time_min <= year_min <= current_price <= year_max <= all_time_max`.
-A failed row keeps its last good values, is flagged and is reported.
+A failed row keeps its last good values, is flagged and is reported. A legacy value that violates
+this rule or came from the old dividend-adjusted calculation is **not** a good value: it becomes
+missing unless a new valid value replaces it.
 
 Massive may check US current prices with one grouped-daily call. Alpha Vantage may check about 22
 non-US current prices per day after its terms are confirmed. All-time values remain Yahoo-only.
-With validation run only on two sync days, a full 800-stock non-US rotation takes about 18 weeks.
+With validation run only on two sync days, a full 800-stock non-US rotation takes about 18 weeks;
+if the manual validation command is run daily, it takes about 5 weeks.
 
 ## 7. Security Considerations
 
 Keep secrets in ignored env files and out of logs, reports and fixtures. Treat provider and
 Trading 212 text as untrusted: use parameterized SQL, template escaping, CSV formula escaping and
-validated symbols. Sync and selection stay behind login and CSRF, with no public maintenance
-route or Docker socket. Local exports stay private and Git-ignored.
+validated symbols. Manual stock sync stays behind login and CSRF. Selection and validation are
+CLI-only, with no public maintenance route or Docker socket. Local exports stay private and Git-ignored.
 
 ## 8. Implementation Phases
 
@@ -161,7 +186,7 @@ The server no longer starts a stock sync by itself, while manual stock sync and 
 
 #### Scope
 
-The existing uncommitted changes in `app.py` and `templates/index.html`, one manual update and
+The changes in `app.py` and `templates/index.html`, committed as `bc0bad4`, one manual update and
 live verification.
 
 #### Do Not Change
@@ -181,7 +206,8 @@ Stock data, sync logic, crypto schedule, proxy, TradingSupport services or serve
 #### Acceptance Criteria
 
 - The running app has no stock scheduler thread and the dashboard says "manual only".
-- No scheduled stock attempt appears after 2026-11-23 14:45 UTC.
+- ~~No scheduled stock attempt appears after 2026-11-23 14:45 UTC.~~ **Waived by owner on 2026-11-22;
+  not observed.** Running code has no stock scheduler.
 - Manual sync route remains protected by login and CSRF.
 - Crypto remains scheduled; row counts and TradingSupport container IDs are unchanged.
 
@@ -252,12 +278,13 @@ Existing DB, `sync.py` mappings and the 2026-11-22 research report.
 - Every finding is marked confirmed or refuted with evidence.
 - The final quota table totals at most 1,000, has US at most 200 and shows each country's supply.
 - Every country below 10 is listed with the reason.
+- The FX source is approved, or the blocker is recorded.
 - Each provider has limits, terms, source links and check date recorded.
 
 #### Verification
 
-Rerun audit queries on a read-only connection and confirm matching counts. `git diff` contains only
-the two new documents and this plan.
+Rerun audit queries on a read-only connection and confirm matching counts. This phase's changes are
+limited to the two new documents and this plan.
 
 #### Security Check
 
@@ -275,11 +302,12 @@ invalid data.
 
 #### Scope
 
-`sync.py`, schema migration, seven reviewed symbol overrides, dashboard field use and focused tests.
+`sync.py`, `refresh.py` stock staleness, schema migration, symbol overrides confirmed in Phase 1,
+stock dashboard fields and focused tests.
 
 #### Do Not Change
 
-Universe size, schedules, crypto, deployment or live data.
+Universe selection, crypto behavior, deployment or live data.
 
 #### Reuse First
 
@@ -291,13 +319,17 @@ Universe size, schedules, crypto, deployment or live data.
 2. Store `current_price` and `price_date` from the latest valid session.
 3. Reject impossible bars, enforce the ordering rule and retain last good values on failure.
 4. Add overrides with name validation and quality flags.
-5. Add regression tests.
+5. Show `current_price` and `price_date`, and mark stock data stale when the last successful manual
+   sync is older than 7 days.
+6. Add regression tests.
 
 #### Acceptance Criteria
 
 - Dividend-adjusted fixtures cannot produce negative or non-traded lows.
-- XEB.F, TBT.F, ROST, LOBO, UA/UAA, GOLD/B and the other overrides pass regression tests.
-- A failed or empty Yahoo response leaves previous values unchanged and flags the row.
+- XEB.F, TBT.F, ROST, LOBO and every override confirmed in Phase 1 pass regression tests.
+- A failed or empty Yahoo response leaves previous valid values unchanged and flags the row.
+- A legacy invalid value is not retained as good data.
+- Stock staleness no longer depends on a weekday schedule. Crypto status is unchanged.
 - Year values use the calendar year; float64 values are preserved.
 - No price history is written to the database.
 
@@ -322,11 +354,12 @@ A manual selection command produces a reviewable list of top-volatile stocks by 
 #### Scope
 
 Selection logic in the smallest suitable existing or new local module, `universe_members`, a CLI
-command, a private CSV review file and tests.
+command, a private CSV review file, member-only sync code, release/Dockerfile entries for any new
+module and tests.
 
 #### Do Not Change
 
-Live membership or dashboard contents until the owner approves the list in Phase 5.
+Live membership, dashboard contents or the server until the owner approves the list in Phase 5.
 
 #### Reuse First
 
@@ -338,6 +371,7 @@ Live membership or dashboard contents until the owner approves the list in Phase
 2. Fetch 63 sessions with resumable progress, then discard them after scoring.
 3. Apply gates, RYZ63, quotas and the 1.3× membership buffer.
 4. Write a private review CSV with reasons for exclusions and unfilled seats.
+5. Restrict `run_sync` to approved members and refuse to call Yahoo when none exist.
 
 #### Acceptance Criteria
 
@@ -346,11 +380,13 @@ Live membership or dashboard contents until the owner approves the list in Phase
 - Bad-tick, illiquid, duplicate-listing, IPO and reverse-split fixtures are handled as specified.
 - Rerunning with the same fixtures gives the same list.
 - Interrupting a run does not change current membership.
+- A retained member never pushes a country above its quota.
+- A sync updates approved members only. With none, it makes no Yahoo request.
 
 #### Verification
 
-Run unit tests with fake providers, then one owner-approved real selection on the server or an
-isolated environment, measuring runtime and peak memory.
+Run unit tests with fake providers, then one owner-approved real selection in an isolated
+environment with no live database writes, measuring runtime and peak memory.
 
 #### Security Check
 
@@ -367,8 +403,9 @@ Selected rows show whether an independent source is consistent with Yahoo.
 
 #### Scope
 
-Small Massive and Alpha Vantage clients, persisted daily call counts, a manual validation command
-and verification labels.
+Small Massive and Alpha Vantage clients using `SDB_MASSIVE_API_KEY` and `SDB_ALPHAVANTAGE_API_KEY`,
+persisted daily call counts, a manual validation command, verification labels, and the matching
+`.env.example` and `deploy/manage.py` allowed keys. Other `SDB_` variables are unused by this plan.
 
 #### Do Not Change
 
@@ -412,7 +449,9 @@ After owner approval, the live dashboard shows the corrected 1,000-stock list.
 
 #### Scope
 
-A rebuild on a database copy, `docs/REBUILD_REPORT.md`, owner review, manual release and first sync.
+A rebuild on a database copy, `docs/REBUILD_REPORT.md`, a reviewed schema/data migration, owner
+review, manual release, first sync, and updates to README, `.env.example`, `deploy/ROLLOUT.md` and
+`docs/deployment.md`.
 
 #### Do Not Change
 
@@ -425,19 +464,27 @@ TradingSupport, crypto data or automatic-sync status.
 #### Steps
 
 1. Build the list and values on a private database copy.
-2. Report old vs new values, change reasons, exclusions, unfilled quotas and flags.
+2. Report old vs new values, change reasons, exclusions, unfilled quotas, removed rows and flags.
 3. Stop for explicit owner approval.
-4. Back up, release and activate membership.
-5. Run one manual sync and verify the dashboard and export.
+4. Rehearse the migration and rollback on a copy, because the update tool stops on schema or
+   row-count changes.
+5. Back up, release, apply the approved migration and activate membership.
+6. Run one manual sync, verify the dashboard and update the listed docs.
 
 #### Acceptance Criteria
 
 - **The owner approves the report before live data changes.**
-- The live list matches the approved list, with no stored price at or below 0.
+- The live list matches the approved list, has at most 1,000 stocks and has no stored price at or
+  below 0.
 - Every row passes the ordering rule or is flagged and reported.
 - A backup can restore the previous stock data.
-- A second manual sync with unchanged provider data changes no values.
+- A second manual sync with unchanged provider data changes no stored market values.
 - No automatic stock run occurs.
+- A selected stock whose mapped symbol has no data can recover through a valid ISIN match.
+- A saved ISIN match is reused on the next manual sync without a new ISIN lookup.
+- No selected row contains data from a market that conflicts with its Trading 212 listing.
+- ETFs and warrants are not in the selected list.
+- The updated docs describe manual stock sync and the selected universe.
 
 #### Verification
 
@@ -459,82 +506,55 @@ evidence and all other criteria still apply. Historical evidence is preserved un
 
 #### Goal
 
-Make the protected dashboard live and prove that scheduled stock-data updates run
-on the server independently of the operator's computer.
+Keep the protected dashboard live on TradingSupport with manual stock sync and automatic crypto.
 
 #### Scope
 
-Execute the reviewed setup workflow on the confirmed TradingSupport server; import
-existing data or bootstrap as established in Phase 1; integrate only the app's
-reviewed route with the existing ingress; collect live evidence in this plan.
+Close the remaining live checks and evidence for the existing deployment.
 
 #### Do Not Change
 
-TradingSupport's other services/data/credentials, global Docker/SSH settings,
-existing provider quotas or other plans' phase statuses. Do not reboot the shared
-server just to test this app; inspect boot configuration and test app restart.
+TradingSupport's other services, data or credentials, global Docker/SSH settings, provider quotas
+or stock data. Do not reboot the shared server just to test this app.
 
 #### Reuse First
 
-Reviewed scripts/configuration, actual shared proxy and DNS, persistent data volume,
-existing scheduler and persistent refresh-status records.
+Existing release, proxy route, persistent volume, crypto scheduler and refresh-status records.
 
 #### Steps
 
-1. Recheck host identity, headroom, existing service health and DNS. Record redacted
-   baseline service identities/start times, app release identity and data counts.
-2. Install only this app with private server credentials. Import consistent data
-   backups if selected; never merge or overwrite an unknown destination volume.
-   Validate initial stock/crypto data without duplicating costly refresh runs.
-3. Activate the app's validated HTTPS/authentication route through the existing
-   ingress. Preserve the previous proxy configuration for recovery. Reload only
-   the proxy if required, verifying existing TradingSupport access throughout.
-4. Verify authenticated browser access, blocked unauthenticated routes, private
-   upstream, live health, scheduler status and configured UTC stock/crypto times.
-5. Recreate/restart only this app while idle; verify both data files, next-run
-   status and scheduling recover. Confirm Docker boot enablement and restart policy.
-6. With the operator's browser/computer disconnected, observe the next real weekday
-   stock trigger through completion. Capture scheduled trigger/start/end, summary,
-   failures and database update timestamps. Preserve the existing daily crypto run
-   and record its automatic completion as well, without unnecessary extra calls.
-7. Check resource use and other services against the baseline. Record hostname,
-   release, backup/recovery locations, schedules and exact evidence timestamps.
+1. Owner confirms that the Crypto view loads after login.
+2. Record the result and compare it with the existing evidence.
 
 #### Acceptance Criteria
 
-- The chosen HTTPS hostname serves both datasets with valid credentials; missing
-  or wrong credentials fail and port 8000 is not publicly reachable.
-- Container and database health are verified; data survives an app-only restart
-  and the server is configured to restart the app/schedulers after boot.
-- **Automatic stock-data updates are active:** a real scheduled weekday run starts
-  and completes on the server with no manual POST, SSH trigger or running local
-  computer. Its completion summary and advancing data timestamps are recorded.
-- Failures/partial coverage are reported accurately; a completed run with provider
-  failures is qualified, not represented as a complete successful refresh.
-- The existing automatic crypto schedule is preserved and its real completion is
-  evidenced without exhausting the provider budget.
-- Existing TradingSupport services stay healthy, with no unintended recreation or
-  restart. The new app remains within measured host capacity.
-- No automatic code-deployment mechanism is installed or enabled.
+- The HTTPS hostname serves Stocks and Crypto with valid credentials. Missing or wrong credentials
+  fail, and port 8000 is not publicly reachable.
+- Container and database health are verified, data survives an app-only restart, and Docker restarts
+  the app and crypto scheduler after boot.
+- Automatic crypto is preserved and a real scheduled completion is recorded.
+- No automatic stock sync or automatic code-deployment mechanism is active.
+- Existing TradingSupport services stay healthy, with no recreation or restart caused by this app's
+  work. The app stays within measured host capacity.
+
+Superseded: the scheduled weekday stock run requirement. The original text is in
+`docs/done/PLAN_deployment.md`.
 
 #### Verification
 
-Use actual app-scoped Compose status/inspection, private health requests, public
-authenticated/unauthenticated HTTPS checks, port inspection, scheduler status,
-redacted start/end logs and SQLite timestamp/count/integrity queries. Compare
-TradingSupport service identities/health to the baseline. Record the commands and
-results actually used; do not publish credentials in URLs or evidence.
-
-A healthy container or a manual sync is insufficient evidence of automatic stock
-updates. If the next weekday run or crypto run has not completed, use
-`Partial — deployed; Remaining: scheduled refresh evidence` and retain the exact
-outstanding observation. Do not mark Ready for Review on mocked/anticipated results.
+Use the recorded live evidence plus the owner's browser confirmation. Do not put credentials in
+URLs or evidence.
 
 #### Security Check
 
 Verify public authentication/CSRF coverage, no upstream bypass, private credential
 and backup permissions, clean secret-free release/log evidence, scoped proxy
 changes and no new exposure of TradingSupport databases or Docker control sockets.
+
+#### Historical Evidence
+
+The records below keep their original wording and old phase numbers. Where they mention scheduled stock
+runs or pending stock evidence, the current criteria above win.
 
 #### Validation Readiness Review (2026-11-21)
 
