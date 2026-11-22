@@ -32,4 +32,19 @@ The first run takes longer (about 6-7 hours) because of the ISIN lookups; later 
 
 Tests: `docker compose run --rm app python -m unittest`
 
-**Security:** the app has no login and is bound to `127.0.0.1` only. Do not expose port 8000 publicly without a reverse proxy with authentication.
+**Security:** the app is bound to `127.0.0.1` only and requires a form token for manual syncs. Do not expose port 8000 publicly without an authenticated HTTPS reverse proxy.
+
+## Server deployment preparation
+
+The [deployment plan](docs/done/PLAN_deployment.md) targets the existing TradingSupport
+server. [Production configuration notes](docs/deployment.md) describe the private
+Compose upstream and the proposed route for its existing Caddy proxy. These files
+prepare deployment. Manual setup/update scripts are documented in
+[deploy/ROLLOUT.md](deploy/ROLLOUT.md); the live rollout remains Phase 4.
+Code deployment stays manual. Automatic stock-data updates continue to use the
+existing weekday `SYNC_TIME_UTC` scheduler, independently of browser access.
+
+The dashboard shows the next scheduled refresh, last attempt, last successful
+completion and stale-data warnings. Refresh status survives container recreation.
+Private deployment coordination and its CLI are described in
+[the deployment notes](docs/deployment.md#refresh-status-and-deployment-coordination).

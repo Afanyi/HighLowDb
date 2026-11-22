@@ -2,6 +2,7 @@
 .env.*
 *.db
 *.db-*
+*.refresh.*.lock
 .git
 .gitignore
 .idea
@@ -13,3 +14,5 @@ compose.yaml
 Dockerfile
 .dockerignore
 README.md
+deploy
+compose.production.yaml

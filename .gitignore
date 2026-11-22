@@ -2,15 +2,20 @@
 .env
 .env.*
 !.env.example
+deploy/server.env
+deploy/backups/
+deploy/releases/
 
 # Database and local data
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.refresh.*.lock
 *.sqlite
 *.sqlite3
 data/
+docs/stocks_export_2026-11-22.csv
 
 # Python
 __pycache__/
