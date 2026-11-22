@@ -262,7 +262,7 @@ def _scheduler_loop(mode, run_job, state_db_path):
             time.sleep(30)
 
 
-threading.Thread(target=_scheduler_loop, args=("stocks", run_sync_job, DB_PATH), daemon=True).start()
+# Stock syncs are started manually; only crypto refreshes on a schedule.
 threading.Thread(target=_scheduler_loop, args=("crypto", run_crypto_sync_job, DB_PATH), daemon=True).start()
 
 
