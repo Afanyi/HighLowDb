@@ -21,17 +21,39 @@ value is better than a wrong value.
 - No price-history tracking, `daily_bars` table, alerts, charts or trading signals.
 - No automatic stock sync, timer, code deployment or second scheduler.
 - No new service, container, database engine, job queue or provider framework.
-- No TradingView data, duplicate provider accounts, key rotation, proxies or IP rotation.
+- No TradingView data, duplicate provider accounts, key rotation to bypass provider limits,
+  proxies or IP rotation. The older blanket key-rotation exclusion is superseded only for the
+  owner-requested Trading 212 credential replacement below.
 - No publication, sharing or commercial use of raw data.
 - No crypto changes. Crypto keeps its automatic CoinGecko schedule.
 
 ## 3. Constraints
 
+- **Owner decision on Trading 212 access (2026-11-25):** the owner will create a replacement
+  **demo API key only for now**, correcting the earlier live-key assumption, because the
+  existing IP restrictions cannot be edited. **Latest owner decision:** enable all available
+  permissions on this demo key, including order execution, to allow future demo trading without
+  another key solely for currently available permissions. This supersedes the metadata-only
+  recommendation. The owner accepts changes to the demo account; this grants no live trading
+  authority and does not add trading implementation or order placement to the current work.
+  Use `T212_ENVIRONMENT=demo`. Allow only the server's and
+  local machine's public outbound IP addresses, using individual addresses rather than broad
+  network ranges. The configured local demo key passed a metadata GET on 2026-11-25; its
+  other permissions and provider-side IP restrictions were not independently inspected.
+  Live API access is deferred until a later explicit owner instruction; the earlier request
+  to configure live credentials now is superseded. **Owner continuation (2026-11-25):** resume
+  Phase 1 using the demo universe and explicitly demo-derived quotas. The older live-universe
+  requirement is superseded for this demo-only audit; live supply remains unverified and must
+  be checked before any future owner-authorized switch to live broker access.
 - **Owner decision on Yahoo (2026-11-22):** Yahoo stays the primary source. The owner was told
   its [terms](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) prohibit automated
   collection and building a database without express prior permission, including through a
   manually started script, and accepted that risk. Never describe Yahoo data as licensed,
   permitted or verified. Yahoo can block the server, so failure must leave old values intact.
+- **Owner decisions on selection (2026-11-22):** measure liquidity and volatility on each company's
+  verified **home exchange**, while each selected stock stays tied to its Trading 212 line. Use
+  **ECB euro reference rates** for traded-value conversion, citing the ECB and stating that values
+  are converted. ECB rates are used only for the selection gate and are not republished.
 - Validators are used only within their own current terms. If terms are unreadable or do not
   allow the use, skip that validator.
 - Extremes use split-adjusted, **not dividend-adjusted** prices (`auto_adjust=False`, never
@@ -83,9 +105,10 @@ value is better than a wrong value.
 
 ### Unknown — inspect before implementation
 
-Live Trading 212 list and quotas (Phase 1 requires a live read-only key in `T212_API_KEY`,
-`T212_API_SECRET` and `T212_ENVIRONMENT=live`); Yahoo fields and throttling for the selected size; whether
-each quota can fill after filters; FX source and terms; current Massive and Alpha Vantage terms
+Live Trading 212 list and quotas (deferred by the 2026-11-25 demo-only owner decision;
+use demo credentials in `T212_API_KEY`, `T212_API_SECRET` and `T212_ENVIRONMENT=demo` for now);
+Yahoo fields and throttling for the selected size; whether
+each quota can fill after home-exchange filters; current Massive and Alpha Vantage terms
 and non-US coverage; how yfinance's split-adjusted values behave for serial reverse splits.
 
 ## 5. Areas to Inspect
@@ -104,7 +127,7 @@ and non-US coverage; how yfinance's split-adjusted values behave for serial reve
    call Yahoo.
 3. **Manual validation:** compare a rotating sample with independent providers.
 
-At 0.5 s pacing a member sync needs about 8–10 minutes. Selection is the larger Yahoo job because
+At 0.5 s pacing a member sync is estimated at about 16 minutes (measured 0.93 s per stock). Selection is the larger Yahoo job because
 it needs 63 sessions for each eligible candidate.
 
 ### Country quotas
@@ -115,7 +138,8 @@ with the owner's US maximum of 200 and target minimum of 10 per country. Other c
 at 15% of the total and 75% of their unique ISINs, except that the owner's minimum of 10 overrides
 the 75% limit where supply allows. Quotas are ceilings. A country may be below 10 only because of
 too little supply or too few stocks passing the gates; empty seats stay empty rather than admitting
-weak stocks. Recalculate from the live ISIN counts in Phase 1 using this same rule.
+weak stocks. Recalculate from the configured demo ISIN counts in Phase 1 using this same rule.
+These are demo quotas, not verified live-account supply or eligibility counts.
 
 ```python
 COUNTRY_QUOTAS = {
@@ -127,8 +151,17 @@ COUNTRY_QUOTAS = {
 
 ### Selection rule (starting values, calibrate on real data)
 
-- Keep `type == "STOCK"` and one line per ISIN, choosing the highest median EUR traded value.
-  Convert traded value with a source approved in Phase 1. Missing FX means the stock is ineligible.
+- Keep `type == "STOCK"` and one Trading 212 line per ISIN: its home-exchange line if offered,
+  otherwise its highest median EUR traded-value line. That line supplies the stored five values.
+- Resolve a separate Yahoo home-listing symbol for screening. Accept it only if ISIN or validated
+  company name, country and exchange agree. No verified home listing means the stock is ineligible.
+- Calculate all gates and RYZ63 on the home listing. Convert traded value with ECB rates. Missing FX
+  means the stock is ineligible.
+- **Phase 1 clarification (2026-11-25):** home listings need ECB rates for JPY, AUD, SEK, DKK,
+  NOK, ILS, SGD, NZD and HKD as well as the original USD, GBP, CAD and CHF. Normalize GBX/GBp
+  through GBP and ILA (agorot) through ILS at 100 minor units per major unit. Load enough FX
+  history for all 63 trading sessions; the 90-calendar-day file can be too short. Never use a
+  future FX observation. Phase 3 owns this conversion and coverage behavior.
 - A new listing needs 68 sessions: skip its first 5, then use the next 63.
 - Over 63 sessions, require at least 57 valid sessions, median traded value of at least €1m,
   at least 90% trading days, at most 6 zero-volume days, at most 20% zero-return days and a
@@ -244,9 +277,9 @@ Confirm no new route, published port, secret output or weakened form protection.
 - The owner accepted closing the phase before `2026-11-23T14:45:00Z`, so the observation that no
   attempt occurs at that time was **not run**.
 
-### Phase 1: Audit current data and confirm the live universe
+### Phase 1: Audit current data and confirm the demo universe
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 0
 
 #### Goal
@@ -268,7 +301,9 @@ Existing DB, `sync.py` mappings and the 2026-11-22 research report.
 #### Steps
 
 1. Confirm or refute every section 4 finding with counts and examples.
-2. Fetch the live Trading 212 list with a read-only key and recalculate ISIN counts and quotas.
+2. Fetch the demo Trading 212 list using read-only metadata requests and recalculate ISIN counts
+   and demo quotas. **Superseded by the demo-only owner decision:** the earlier requirement to
+   fetch live-account metadata in Phase 1. Broader demo key permissions do not authorize orders.
 3. Map countries, exchanges, Yahoo suffixes and currencies, including GBX.
 4. Check Massive, Alpha Vantage and FX-source terms and coverage.
 5. Sample Yahoo to measure runtime, memory, raw/split-adjusted fields and filter pass rates.
@@ -276,7 +311,10 @@ Existing DB, `sync.py` mappings and the 2026-11-22 research report.
 #### Acceptance Criteria
 
 - Every finding is marked confirmed or refuted with evidence.
-- The final quota table totals at most 1,000, has US at most 200 and shows each country's supply.
+- The demo quota table totals at most 1,000, has US at most 200 and shows each country's demo
+  supply. Label the table demo-derived; do not present it as live-account verification or as
+  proof that quotas will fill after home-exchange filters. The older live-table requirement
+  is superseded for Phase 1 by the demo-only owner decision.
 - Every country below 10 is listed with the reason.
 - The FX source is approved, or the blocker is recorded.
 - Each provider has limits, terms, source links and check date recorded.
@@ -289,6 +327,132 @@ limited to the two new documents and this plan.
 #### Security Check
 
 Confirm neither document or sampled output contains a key, secret or credential.
+
+#### Execution Evidence (2026-11-22)
+
+- `docs/AUDIT.md` written: every section 4 finding marked confirmed/refuted with evidence;
+  CSV audit re-run reproduces 309 rows with `all_time_min <= 0` (277 negative, 244 Frankfurt),
+  389 with ATH/ATL > 10,000, 3 without year values, 0 without a Yahoo symbol; float32 artifact
+  examples recorded; XEB.F (−2,816,771.75) and ROST (0.0833) dividend-adjustment confirmed via
+  live Yahoo sample vs split-adjusted (`auto_adjust=False`) values 4.63 and 0.1133.
+- `docs/SOURCES.md` written: Yahoo, Trading 212, Massive, Alpha Vantage and FX-source limits,
+  terms, source links and check dates recorded; no key values present.
+- Trading 212 demo fetch succeeded: 17,166 instruments (10,371 STOCK / 6,775 ETF / 20 WARRANT),
+  9,166 unique stock ISINs, matching the plan's demo description; country supply and quota
+  table calculated (totals 1,000, US 200; NZ supply 6 and HK supply 3 below 10 due to supply).
+- Full unittest suite passes: 187 tests OK.
+- Blockers recorded: `T212_ENVIRONMENT=demo` (Phase 1 requires `live` + live keys); no FX source
+  approved yet; latest Yahoo price-close date not yet confirmed.
+
+#### Review Result (2026-11-22)
+
+**Review Failed.** No security blocker was found. Only this review record was added.
+
+Reproduced: 9,695 rows, 309 at or below 0 (277 negative, 244 Frankfurt), 3 without year values,
+0 without a Yahoo symbol, 17,166 demo instruments, 9,166 unique stock ISINs, 63 prefixes, 8,244 ISINs
+in the 23 countries and all country and currency counts. **187 unittests passed** in an isolated
+container with no network. Live release is `c9bad96e9fd67e20`, with 0 stock scheduler starts, 1 CPU,
+1.9 GB RAM and 33 GB free. Yahoo samples were not rerun.
+
+Blocking:
+
+1. **Finding 4.4 is wrongly refuted.** The finding is the ATH/ATL **ratio** above 10,000, which
+   reproduces at **471**. The audit counted individual values above 10,000 (389).
+2. **Findings A, C and D are neither confirmed nor refuted.** Price end date, all seven symbol
+   mappings and LOBO can be checked with a small Yahoo sample and do not depend on the live list.
+   The CSV shows each of the seven symbols is shared by two instruments, but that is not proof.
+3. **The live Trading 212 list was not fetched,** so final supply and quotas are not established.
+4. **Step 5 is incomplete.** Runtime and memory were not measured, filter pass rates are absent, and
+   two symbols do not reproduce the reported 184 of 185 result.
+5. **`docs/AUDIT.md` contradicts itself.** It says no country is below 10 in supply and that NZ/HK
+   supply is not exhausted, while showing NZ 6 and HK 3 with quotas equal to all supply.
+6. **Some statuses lack evidence.** Finding 4.14 is "Confirmed" while "Not re-inspected", and 4.15 is
+   unverified although read-only server access exists.
+7. **`docs/SOURCES.md` is incomplete.** FX terms are unconfirmed; Alpha Vantage storage is not answered;
+   Massive's deletion within 30 days after the licence ends is missing; the Yahoo terms are labeled
+   "owner-reviewed" without a record; and the Twelve Data, Finnhub and FMP exclusion reason is unsupported.
+
+Optional: remove placeholder tickers `XYZm_EQ` and `ABCz_EQ` from the section labeled as confirmed
+against demo tickers, and delete or restrict `/tmp/t212_instruments.json` (mode 0664; instrument
+metadata). A pattern scan of the two audit documents found no credentials.
+
+#### Rework Evidence (2026-11-22)
+
+- All blocking review items that do not need owner input are fixed in `docs/AUDIT.md` and
+  `docs/SOURCES.md`. Findings 4.4, A, B, C and D are confirmed with evidence.
+- Yahoo sample: 418 ISINs across 23 countries, 363 with data, 0 exceptions, 390.5 s, 146.6 MiB peak.
+  104 passed all gates. 249 failed the EUR 1m liquidity gate.
+- Likely unfilled quotas with the current rule: JP, DE, AU, SE, DK, FI, NO, SG, IT, NZ, HK. In a German test of 30 stocks, 0
+  passed through `.F` and 8 through `.DE`, so the current Frankfurt measurement needs an owner decision.
+- ECB and Massive terms were read, and Alpha Vantage's PDF text was extracted.
+- Full suite last run: 187 tests passed in an isolated container with no network.
+- **Owner decisions (2026-11-22):** use the home exchange for liquidity and volatility; ECB approved.
+- **Rework continuation (2026-11-25):** demo supply, quotas and the home-exchange sample are now
+  checked as recorded below. Historical live-key blockers are superseded for this demo audit
+  and do not authorize live access. The phase awaits review.
+
+#### Continuation Evidence (2026-11-25)
+
+- Owner requested demo only, then resumed Phase 1. Updated this phase's title, steps and quota
+  criterion accordingly; no live broker access, orders, application changes or production writes.
+- Local demo metadata GET returned HTTP 200: 17,162 instruments, 10,371 stocks, 9,166 unique stock
+  ISINs and 8,246 in the 23 selected countries. Demo quotas recalculated from the cited MSCI
+  weights and current supply still total 1,000, US 200; NZ 6 and HK 3 are limited by supply.
+- CSV and read-only server SQLite counts reproduce 9,695 rows, 309 nonpositive lows (277 negative),
+  471 ATH/ATL ratios above 10,000 and 3 missing year ranges. Server integrity is `ok`; no stock
+  scheduler start remains in running app source.
+- Completed-session home-exchange probe: 45 selected ISINs across 23 countries, 155.88 s,
+  233.26 MiB peak in a 512 MiB / 1 CPU container. Initially 42 passes, 1 exclusion and 2 unavailable
+  symbols. Issuer/exchange-backed follow-up verified ROP.SW and A5G.IR (7.56 s, 233.64 MiB),
+  bringing this selected sample to 44 passes; AIR.NZ fails liquidity, price and zero-return gates.
+  This is not a representative sample or proof that country quotas will fill.
+- Home screening requires 13 ECB currencies plus GBX/GBp and ILA unit normalization. The full FX
+  history resolves the 90-day file's insufficient coverage of some 63-session windows. These
+  requirements are assigned to Phase 3; completed price-session handling belongs to Phase 2.
+- Additional Roche mapping evidence: T212 `ROGs_EQ`, ISIN `CH1499059983`, corresponds to ROP,
+  not the discontinued ROG symbol; preserve the distinction from bearer share RO. A5G.IR is
+  the verified AIB Dublin screening symbol. Evidence and primary-source links are in the audit.
+- Split-only probes: LOBO and TBT each have one reverse split; diagnostic ETF SQQQ has eight.
+  Positive lows and near-continuous split-date closes support that provider history is already
+  split-adjusted. They do not prove every historic extreme; do not double-apply split factors.
+- All 187 unittests passed in 3.638 s in a read-only container with no network, dummy keys and
+  temporary databases. Quota bounds, the planned quota dictionary, sample identities, session
+  counts, FX coverage and the eight-split aggregate passed direct consistency checks.
+- Literal configured-secret scan of all three documents and temporary audit artifacts found no
+  credentials. Env files remain 0600 and ignored; current audit data is 0600 in a 0700 directory.
+  `git diff --check` passed. No security issue was identified in this documentation-only change.
+- Updated `docs/AUDIT.md`, `docs/SOURCES.md` and this plan. **Ready for Review**, not passed review.
+  Live broker supply, full candidate screening and later-phase implementations remain unverified.
+
+#### Review Result (2026-11-25)
+
+**Done — Passed Review.** Reviewed the whole active plan for consistency with the demo-only
+owner decision, the actual plan diff, both audit documents, current application code and the
+private metadata/sample artifacts. No blocking findings or credible security issues were found.
+
+| Acceptance criterion | Review evidence | Result |
+|---|---|---|
+| Findings confirmed or refuted with evidence | Rechecked code references and CSV counts; independently fetched company metadata for the seven ticker-mismatch pairs. Under Armour's issuer FAQ confirms UAA = Class A and UA = Class C. Historical price/date and adjustment samples are explicitly dated; new LOBO/serial-split evidence is retained in the audit. | Passed |
+| Demo quota table and country supply | Independently recomputed square-root allocations from the metadata and cited MSCI weights, including bounds and largest remainders; compared with both the audit table and plan dictionary. Supply 8,246; quotas 1,000; US 200. | Passed |
+| Countries below 10 explained | NZ supply/quota 6 and HK 3; no other quota is below 10. Neither table claims the quotas will fill after screening. | Passed |
+| FX approved or blocker recorded | ECB owner approval is explicit. Full-window FX, 13 currencies and GBX/GBp/ILA conversions agree with the probe and are assigned to Phase 3. | Passed |
+| Provider limits, terms, sources and dates | Source document records the required details and uncertainties. Rechecked Alpha Vantage terms/25-call allowance and Massive personal-use/deletion terms against primary sources. Future validator use remains subject to Phase 4's terms check. | Passed |
+
+- Fresh read-only server SQLite queries reproduce 9,695 rows, 309 nonpositive lows, 277 negative
+  lows, 471 ATH/ATL ratios over 10,000 and 3 missing year ranges; integrity `ok`, latest update
+  `2026-11-15 09:48:45`, no stock scheduler starts in running source. CSV counts agree.
+- All 187 unittests passed again in 3.630 s in the isolated, read-only, network-disabled container
+  with dummy keys and temporary databases. No application, database or server configuration changed.
+- Reviewed aggregate sample evidence: 45 identities across 23 countries, 63 valid sessions and
+  complete FX for each, 44 basic-probe passes after the two verified symbol corrections.
+  The report correctly discloses selection bias and incomplete production-screen coverage.
+- Literal and encoded configured-credential scan passed for the documents and retained artifacts;
+  env/data permissions passed. `git diff --check` passed. No runtime files are in the diff.
+- Review limits: did not rerun the historical 418-stock price sample or a full candidate screen,
+  inspect the provider-side IP allowlist, exercise order permissions or use a live brokerage key.
+  None is claimed as newly verified. No optional finding prevents acceptance of this audit.
+- Phase 2's dependency is now satisfied; no later phase was started. The plan remains active
+  because Phases 2–6 are unfinished.
 
 ### Phase 2: Correct the five stored values
 
@@ -317,6 +481,8 @@ Universe selection, crypto behavior, deployment or live data.
 
 1. Request `auto_adjust=False` and use split-adjusted OHLC only.
 2. Store `current_price` and `price_date` from the latest valid session.
+   Exclude an unfinished current-day bar and discard event-only rows with no OHLC before
+   choosing that session; an action row is not a price observation.
 3. Reject impossible bars, enforce the ordering rule and retain last good values on failure.
 4. Add overrides with name validation and quality flags.
 5. Show `current_price` and `price_date`, and mark stock data stale when the last successful manual
@@ -363,15 +529,18 @@ Live membership, dashboard contents or the server until the owner approves the l
 
 #### Reuse First
 
-`fetch_instruments`, `_Yahoo` pacing, `refresh.job_guard` locking and Phase 1 quotas.
+`fetch_instruments`, `_Yahoo` pacing and ISIN lookup, `refresh.job_guard` locking, Phase 1 quotas and
+ECB rates.
 
 #### Steps
 
-1. Build candidates by ISIN and country.
-2. Fetch 63 sessions with resumable progress, then discard them after scoring.
-3. Apply gates, RYZ63, quotas and the 1.3× membership buffer.
-4. Write a private review CSV with reasons for exclusions and unfilled seats.
-5. Restrict `run_sync` to approved members and refuse to call Yahoo when none exist.
+1. Build candidates by ISIN and country, keeping one Trading 212 line.
+2. Resolve and validate each home-exchange listing.
+3. Fetch 63 home-listing sessions with resumable progress, then discard them after scoring.
+4. Apply ECB conversion, gates, RYZ63, quotas and the 1.3× membership buffer.
+5. Write a private review CSV with Trading 212 line, home listing, reasons for exclusions and
+   unfilled seats.
+6. Restrict `run_sync` to approved members and refuse to call Yahoo when none exist.
 
 #### Acceptance Criteria
 
@@ -380,6 +549,11 @@ Live membership, dashboard contents or the server until the owner approves the l
 - Bad-tick, illiquid, duplicate-listing, IPO and reverse-split fixtures are handled as specified.
 - Rerunning with the same fixtures gives the same list.
 - Interrupting a run does not change current membership.
+- Liquidity and volatility come from a verified home listing; an unverified listing is ineligible.
+- Every selected stock remains mapped to a tradable Trading 212 line.
+- Missing ECB FX makes a stock ineligible. All home-listing currencies above are supported;
+  GBX/GBp is converted through GBP and ILA through ILS without a 100-fold unit error. FX history
+  covers the entire screening window without future-date rates.
 - A retained member never pushes a country above its quota.
 - A sync updates approved members only. With none, it makes no Yahoo request.
 
