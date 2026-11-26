@@ -57,7 +57,8 @@ class TestRefresh(unittest.TestCase):
         partial = self.run_stock({"ok": 7, "failed": 1})
         self.assertEqual(partial["state"], "partial")
         self.assertEqual(partial["last_success_at"], success)
-        self.assertTrue(partial["stale"])
+        # One day after success: not stale under the 7-day rule.
+        self.assertFalse(partial["stale"])
         failed = self.run_stock(error=RuntimeError("secret-provider-value"))
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(failed["last_success_at"], success)
@@ -91,7 +92,8 @@ class TestRefresh(unittest.TestCase):
         sunday = friday + timedelta(days=2)
         self.assertFalse(refresh.status(self.db, "stocks", sunday)["stale"])
         self.assertEqual(refresh.status(self.db, "stocks", sunday)["next_run"], "2026-01-12T14:45:00+00:00")
-        self.assertTrue(refresh.status(self.db, "stocks", sunday + timedelta(days=1))["stale"])
+        # Three days after success: still not stale under the 7-day rule.
+        self.assertFalse(refresh.status(self.db, "stocks", sunday + timedelta(days=1))["stale"])
 
     def test_missed_weekday_slot_waits_until_monday_instead_of_running_on_weekend(self):
         friday = datetime(2026, 1, 9, 14, 44, tzinfo=timezone.utc)
@@ -357,6 +359,26 @@ with refresh.job_guard(sys.argv[1], 'stocks') as admitted:
             with self.assertRaises(ValueError), refresh.deployment_guard(self.db, timeout):
                 pass
         self.assertEqual(list(Path(self.directory).iterdir()), [])
+
+    def test_stock_staleness_is_seven_days_not_weekday_schedule(self):
+        """Stock staleness uses 7 days since last success, not the weekday schedule."""
+        self.run_stock()  # success at Tuesday 2026-01-06T14:46
+        # Four days later (Saturday): not stale under the 7-day rule,
+        # even though the weekday schedule would consider it stale.
+        saturday = self.now + timedelta(days=4)
+        status = refresh.status(self.db, "stocks", saturday)
+        self.assertFalse(status["stale"])
+        # Eight days later: stale.
+        next_wednesday = self.now + timedelta(days=8)
+        status = refresh.status(self.db, "stocks", next_wednesday)
+        self.assertTrue(status["stale"])
+
+    def test_crypto_staleness_unchanged_by_stock_rule(self):
+        """Crypto staleness still uses the daily schedule, not the 7-day stock rule."""
+        self.run_stock()  # this only touches stocks state
+        # Crypto state is independent; check it uses its own schedule.
+        status = refresh.status(self.db, "crypto", self.now)
+        self.assertEqual(status["schedule"], "Daily at 02:00 UTC")
 
 
 if __name__ == "__main__":

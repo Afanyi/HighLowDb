@@ -94,20 +94,27 @@ SYNC_HH, SYNC_MM = (int(x) for x in SYNC_TIME_UTC.split(":"))
 if not (0 <= SYNC_HH <= 23 and 0 <= SYNC_MM <= 59):
     raise ValueError(f"SYNC_TIME_UTC must be HH:MM, got {SYNC_TIME_UTC!r}")
 
-STATUS_PATTERN = re.compile(r"^(ACTIVE|DELISTED_OR_ZERO|NEW_\d{4})$")
+STATUS_PATTERN = re.compile(r"^(ACTIVE|DELISTED_OR_ZERO|STALE|INVALID_VALUES|NEW_\d{4})$")
 
 ALLOWED_SORTS = {
-    "ticker", "name", "exchange", "instrument_type", "opening_price", "year_max", "year_min",
+    "ticker", "name", "exchange", "instrument_type", "current_price", "year_max", "year_min",
     "all_time_max", "all_time_min", "status_tag", "last_updated",
 }
 # Distance columns: "% below highs" and "% above lows" of the current price.
-DISTANCES = {
+# Stocks use current_price; crypto keeps opening_price.
+STOCK_DISTANCES = {
+    "pct_year_max":     ("% below Year High",     "(year_max - current_price) * 100.0 / NULLIF(year_max, 0)"),
+    "pct_year_min":     ("% above Year Low",      "(current_price - year_min) * 100.0 / NULLIF(year_min, 0)"),
+    "pct_all_time_max": ("% below All-Time High", "(all_time_max - current_price) * 100.0 / NULLIF(all_time_max, 0)"),
+    "pct_all_time_min": ("% above All-Time Low",  "(current_price - all_time_min) * 100.0 / NULLIF(all_time_min, 0)"),
+}
+CRYPTO_DISTANCES = {
     "pct_year_max":     ("% below Year High",     "(year_max - opening_price) * 100.0 / NULLIF(year_max, 0)"),
     "pct_year_min":     ("% above Year Low",      "(opening_price - year_min) * 100.0 / NULLIF(year_min, 0)"),
     "pct_all_time_max": ("% below All-Time High", "(all_time_max - opening_price) * 100.0 / NULLIF(all_time_max, 0)"),
     "pct_all_time_min": ("% above All-Time Low",  "(opening_price - all_time_min) * 100.0 / NULLIF(all_time_min, 0)"),
 }
-ALLOWED_SORTS |= set(DISTANCES)
+ALLOWED_SORTS |= set(STOCK_DISTANCES) | set(CRYPTO_DISTANCES)
 
 # Fixed grouping ranges: lower inclusive, upper exclusive; NULL is "n/a".
 BUCKETS = [(None, 0), (0, 10), (10, 25), (25, 50), (50, 100), (100, None)]
@@ -126,7 +133,8 @@ STOCK_BASE_COLUMNS = [
     ("name", "Name"),
     ("exchange", "Exchange"),
     ("instrument_type", "Type"),
-    ("opening_price", "Open"),
+    ("current_price", "Price"),
+    ("price_date", "Date"),
     ("year_max", "Year High"),
     ("year_min", "Year Low"),
     ("all_time_max", "All-Time High"),
@@ -151,19 +159,21 @@ CRYPTO_BASE_COLUMNS = [
 MODES = {
     "stocks": {
         "table": "stocks",
-        "columns": STOCK_BASE_COLUMNS + [(key, label) for key, (label, _expr) in DISTANCES.items()],
+        "columns": STOCK_BASE_COLUMNS + [(key, label) for key, (label, _expr) in STOCK_DISTANCES.items()],
         "db_columns": [col for col, _ in STOCK_BASE_COLUMNS],
+        "distances": STOCK_DISTANCES,
         "search": ["ticker", "name"],
         "default_sort": ("ticker", "asc"),
         "sorts": {
-            "ticker", "name", "exchange", "instrument_type", "opening_price", "year_max", "year_min",
+            "ticker", "name", "exchange", "instrument_type", "current_price", "year_max", "year_min",
             "all_time_max", "all_time_min", "status_tag", "last_updated",
         },
     },
     "crypto": {
         "table": "crypto",
-        "columns": CRYPTO_BASE_COLUMNS + [(key, label) for key, (label, _expr) in DISTANCES.items()],
+        "columns": CRYPTO_BASE_COLUMNS + [(key, label) for key, (label, _expr) in CRYPTO_DISTANCES.items()],
         "db_columns": ["ticker"] + [col for col, _ in CRYPTO_BASE_COLUMNS],
+        "distances": CRYPTO_DISTANCES,
         # ticker is the CoinGecko id (e.g. "bitcoin"); people search by symbol ("btc").
         "search": ["ticker", "symbol", "name"],
         # Biggest coins first; unranked coins go last (ORDER BY puts NULLs last).
@@ -262,7 +272,7 @@ def _scheduler_loop(mode, run_job, state_db_path):
             time.sleep(30)
 
 
-threading.Thread(target=_scheduler_loop, args=("stocks", run_sync_job, DB_PATH), daemon=True).start()
+# Stock syncs are started manually; only crypto refreshes on a schedule.
 threading.Thread(target=_scheduler_loop, args=("crypto", run_crypto_sync_job, DB_PATH), daemon=True).start()
 
 
@@ -271,7 +281,7 @@ def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, instrument
     cfg = MODES[mode]
     if sorts is None:
         sorts = [cfg["default_sort"]]
-    sorts_whitelist = cfg["sorts"] | set(DISTANCES)
+    sorts_whitelist = cfg["sorts"] | set(cfg["distances"])
     levels = []
     for col, direction in sorts:
         if col not in sorts_whitelist:
@@ -284,7 +294,7 @@ def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, instrument
     order = ", ".join(f"{col} IS NULL, {col} {direction}" for col, direction in levels)
     order += ", ticker"
 
-    dist_exprs = ", ".join(f"({expr}) AS {key}" for key, (_label, expr) in DISTANCES.items())
+    dist_exprs = ", ".join(f"({expr}) AS {key}" for key, (_label, expr) in cfg["distances"].items())
     select_cols = ", ".join(cfg["db_columns"])
     sql = f"SELECT * FROM (SELECT {select_cols}, {dist_exprs} FROM {cfg['table']})"
     params = []
@@ -308,7 +318,7 @@ def _query_rows(mode=DEFAULT_MODE, status=None, q=None, country=None, instrument
         params.append(instrument_type)
     if bounds:
         for key, op, value in bounds:
-            if key in DISTANCES and op in (">=", "<="):
+            if key in cfg["distances"] and op in (">=", "<="):
                 conditions.append(f"{key} {op} ?")
                 params.append(value)
     if conditions:
@@ -415,7 +425,7 @@ def index():
     mode = mode_of(request.args)
     cfg = MODES[mode]
     columns = cfg["columns"]
-    sorts_whitelist = cfg["sorts"] | set(DISTANCES)
+    sorts_whitelist = cfg["sorts"] | set(cfg["distances"])
     status = request.args.get("status", "").strip() or None
     q = request.args.get("q", "").strip() or None
     country = None if mode == "crypto" else (request.args.get("country", "").strip() or None)
@@ -423,7 +433,7 @@ def index():
     if instrument_type not in ("STOCK", "ETF"):
         instrument_type = None
     group = request.args.get("group", "").strip()
-    if group not in DISTANCES:
+    if group not in cfg["distances"]:
         group = None
     sorts = _parse_sorts(request.args, sorts_whitelist, cfg["default_sort"])
     bounds = []
@@ -438,7 +448,7 @@ def index():
         filters["instrument_type"] = instrument_type
     if group:
         filters["group"] = group
-    for key in DISTANCES:
+    for key in cfg["distances"]:
         for bound in ("min", "max"):
             value = _parse_pct(request.args.get(f"{bound}_{key}", ""))
             if value is not None:
@@ -493,8 +503,9 @@ def index():
         filters=filters,
         nav_filters=nav_filters,
         columns=columns,
-        distance_labels={key: label for key, (label, _expr) in DISTANCES.items()},
-        numeric_cols={"opening_price", "year_max", "year_min", "all_time_max", "all_time_min", *DISTANCES},
+        distance_labels={key: label for key, (label, _expr) in cfg["distances"].items()},
+        numeric_cols={"current_price" if mode == "stocks" else "opening_price",
+                      "year_max", "year_min", "all_time_max", "all_time_min", *cfg["distances"]},
         countries=sorted(sync.EXCHANGE_COUNTRIES.values()),
         summary=summary,
         running=running,

@@ -121,9 +121,9 @@ class TestAppRoutes(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("BPl_EQ", "BP plc", "LSE", 5.0, 6.0, 4.0, 7.0, 3.0, "ACTIVE"),
@@ -150,6 +150,27 @@ class TestAppRoutes(unittest.TestCase):
         resp = self.client.get("/")
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b"AAPL_US_EQ", resp.data)
+
+    def test_stock_row_cells_follow_header_order(self):
+        import re
+        html = self.client.get("/?q=AAPL").get_data(as_text=True)
+        row = re.search(r"<tr[^>]*>\s*<td>AAPL_US_EQ</td>.*?</tr>", html, re.S).group(0)
+        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+        # Ticker, Name, Exchange, Type, Price, Date, Year High, Year Low, ATH, ATL, Status.
+        self.assertIn("100", cells[4])
+        self.assertRegex(cells[5], r"^\d{4}-\d{2}-\d{2}")
+        self.assertIn("110", cells[6])
+        self.assertIn("80", cells[9])
+        self.assertEqual(cells[10], "ACTIVE")
+
+    def test_status_filter_stale(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE stocks SET status_tag='STALE' WHERE ticker='BPl_EQ'")
+        conn.commit()
+        conn.close()
+        html = self.client.get("/?status=STALE").get_data(as_text=True)
+        self.assertIn("BPl_EQ", html)
+        self.assertNotIn("AAPL_US_EQ", html)
 
     def test_status_filter_new_2026(self):
         resp = self.client.get("/?status=NEW_2026")
@@ -268,7 +289,7 @@ class TestAppRoutes(unittest.TestCase):
         }
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn("2026-11-13T16:00:00", html)
-        self.assertEqual(html.count("OK: 7, No data: 4, Failed: 2, Unmapped: 3"), 1)
+        self.assertEqual(html.count("OK: 7, No data: 4, Invalid: 0, Failed: 2, Unmapped: 3"), 1)
 
     def test_get_sync_returns_405(self):
         resp = self.client.get("/sync")
@@ -287,9 +308,9 @@ class TestDistanceFilters(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("BPl_EQ", "BP plc", "LSE", 5.0, 6.0, 4.0, 7.0, 3.0, "ACTIVE"),
@@ -414,9 +435,9 @@ class TestMultiColumnSort(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAC_US_EQ", "AAC Corp", "US", 200.0, 90.0, 80.0, 250.0, 70.0, "ACTIVE"),
                 ("AAA_US_EQ", "AAA Corp", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
@@ -442,7 +463,7 @@ class TestMultiColumnSort(unittest.TestCase):
     def test_three_levels_and_fourth_ignored(self):
         resp = self.client.get(
             "/?sort=year_max&dir=asc&sort=name&dir=desc&sort=exchange&dir=asc"
-            "&sort=opening_price&dir=desc"
+            "&sort=current_price&dir=desc"
         )
         self.assertEqual(resp.status_code, 200)
         html = resp.get_data(as_text=True)
@@ -511,8 +532,8 @@ class TestMultiColumnSort(unittest.TestCase):
         hrefs = [html_lib.unescape(h) for h in re.findall(r'<th[^>]*>\s*<a href="([^"]+)"', html)]
         links = {parse_qs(urlsplit(h).query)["sort"][0]: parse_qs(urlsplit(h).query) for h in hrefs}
         # Clicking another column makes it level 1 and moves the others down.
-        self.assertEqual(links["opening_price"]["sort"], ["opening_price", "year_max", "name"])
-        self.assertEqual(links["opening_price"]["dir"], ["asc", "asc", "desc"])
+        self.assertEqual(links["current_price"]["sort"], ["current_price", "year_max", "name"])
+        self.assertEqual(links["current_price"]["dir"], ["asc", "asc", "desc"])
         # Clicking the primary column flips only its direction.
         self.assertEqual(links["year_max"]["sort"], ["year_max", "name"])
         self.assertEqual(links["year_max"]["dir"], ["desc", "desc"])
@@ -547,7 +568,7 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(app_module._parse_sorts(args), [("ticker", "asc")])
         args = _Args(sort=["ticker", "ticker"], dir=["asc", "desc"])
         self.assertEqual(app_module._parse_sorts(args), [("ticker", "asc")])
-        args = _Args(sort=["ticker", "name", "exchange", "opening_price"], dir=["asc"] * 4)
+        args = _Args(sort=["ticker", "name", "exchange", "current_price"], dir=["asc"] * 4)
         self.assertEqual(
             app_module._parse_sorts(args),
             [("ticker", "asc"), ("name", "asc"), ("exchange", "asc")],
@@ -567,8 +588,8 @@ class TestHelpers(unittest.TestCase):
         )
         sorts = [("ticker", "asc"), ("name", "desc"), ("exchange", "asc")]
         self.assertEqual(
-            app_module._header_sorts(sorts, "opening_price"),
-            [("opening_price", "asc"), ("ticker", "asc"), ("name", "desc")],
+            app_module._header_sorts(sorts, "current_price"),
+            [("current_price", "asc"), ("ticker", "asc"), ("name", "desc")],
         )
 
     def test_bucket_label(self):
@@ -608,9 +629,9 @@ class TestCountryFilter(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("SXR8d_EQ", "iShares Core", "FRANKFURT", 200.0, 220.0, 180.0, 250.0, 150.0, "ACTIVE"),
@@ -666,9 +687,9 @@ class TestSortLinks(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("BPl_EQ", "BP plc", "LSE", 5.0, 6.0, 4.0, 7.0, 3.0, "ACTIVE"),
@@ -714,9 +735,9 @@ class TestNullsLast(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("A_WITH_YEAR_MAX", "A", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("B_NO_YEAR_MAX", "B", "US", 50.0, None, None, 100.0, 40.0, "ACTIVE"),
@@ -759,9 +780,9 @@ class TestNoRowCap(unittest.TestCase):
             for i in range(600)
         ]
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             rows,
         )
         conn.commit()
@@ -841,9 +862,9 @@ class TestCryptoMode(unittest.TestCase):
         sync_mod.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.executemany(
-            "INSERT INTO stocks (ticker, name, exchange, opening_price, year_max, year_min, "
+            "INSERT INTO stocks (ticker, name, exchange, current_price, price_date, year_max, year_min, "
             "all_time_max, all_time_min, status_tag, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))",
             [
                 ("AAPL_US_EQ", "Apple Inc.", "US", 100.0, 110.0, 90.0, 150.0, 80.0, "ACTIVE"),
                 ("BPl_EQ", "BP plc", "LSE", 5.0, 6.0, 4.0, 7.0, 3.0, "ACTIVE"),

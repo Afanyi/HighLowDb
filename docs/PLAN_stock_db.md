@@ -1,534 +1,984 @@
-# Implementation Plan: `stock-db` Truthful Daily Stock Database
+# Implementation Plan: `stock-db` 1,000 Volatile Stocks
 
 ## 1. Goal
 
-Fix the existing stock database and turn it into a self-updating daily pipeline, using
-only free sources, so that:
+Turn the existing stock dashboard into a small, correct, manually refreshed list of **up to
+1,000 of the most volatile eligible Trading 212 stocks across 23 developed markets**. Seats stay
+empty when not enough stocks are eligible.
 
-1. every stock and ETF tradable on Trading 212 is in the database;
-2. it updates automatically every day and keeps working when one source fails or hits
-   its limit;
-3. the data is truthful and legitimate. **A missing value is better than a wrong value.**
+For each selected stock, the only market values stored are:
 
-It runs on the owner's Oracle Cloud ARM server, beside the other bots, as its own service.
+- all-time max and min;
+- current price, defined as the latest valid close, with its price date;
+- calendar-year max and min, if available.
+
+Identity, selection and quality fields listed under "Data changes" may also be stored. A missing
+value is better than a wrong value.
 
 ## 2. Non-Goals
 
-- No paid provider. EODHD EOD All World is only documented as a possible future upgrade.
-- No duplicate provider accounts, key rotation, proxies or IP rotation to evade limits.
-- No publication of raw data. Data is for the owner's personal use.
-- No crypto pipeline changes.
-- No replacement of live values before the owner approves the rebuild review.
+- No all-stock coverage, ETFs, warrants or funds in the selected list.
+- No price-history tracking, `daily_bars` table, alerts, charts or trading signals.
+- No automatic stock sync, timer, code deployment or second scheduler.
+- No new service, container, database engine, job queue or provider framework.
+- No TradingView data, duplicate provider accounts, key rotation to bypass provider limits,
+  proxies or IP rotation. The older blanket key-rotation exclusion is superseded only for the
+  owner-requested Trading 212 credential replacement below.
+- No publication, sharing or commercial use of raw data.
+- No crypto changes. Crypto keeps its automatic CoinGecko schedule.
 
 ## 3. Constraints
 
-- **Truth before completeness.** Never write a value that failed validation. Keep the
-  last good value, mark the row and report it.
-- **Free and legitimate.** Exactly one free account per provider. Respect terms, rate
-  limits and `Retry-After`.
-- **Real traded prices.** Extremes use split-adjusted, **not** dividend-adjusted daily
-  OHLC. Never use `Adj Close` or `auto_adjust=True` for extremes.
-- **Store the evidence.** Keep daily bars per source. Every derived value must be
-  recomputable, and every row must state its source(s) and time.
-- **Full precision.** 8-byte REAL, `DOUBLE PRECISION` or `NUMERIC`; never float32.
-- **Check current docs first.** Read each provider's official docs and terms before coding
-  it. Record verified limits in `SOURCES.md`.
-- **Secrets** live only in Git-ignored env files, with `.env.example` provided.
-- Code, comments, logs and commit messages are in English.
-- Each phase ends with green tests, a short summary and owner approval before the next.
-- Keep simple, reuse existing code and make no unrelated changes. No commit or push
-  unless the owner asks.
+- **Owner decision on Trading 212 access (2026-11-25):** the owner will create a replacement
+  **demo API key only for now**, correcting the earlier live-key assumption, because the
+  existing IP restrictions cannot be edited. **Latest owner decision:** enable all available
+  permissions on this demo key, including order execution, to allow future demo trading without
+  another key solely for currently available permissions. This supersedes the metadata-only
+  recommendation. The owner accepts changes to the demo account; this grants no live trading
+  authority and does not add trading implementation or order placement to the current work.
+  Use `T212_ENVIRONMENT=demo`. Allow only the server's and
+  local machine's public outbound IP addresses, using individual addresses rather than broad
+  network ranges. The configured local demo key passed a metadata GET on 2026-11-25; its
+  other permissions and provider-side IP restrictions were not independently inspected.
+  Live API access is deferred until a later explicit owner instruction; the earlier request
+  to configure live credentials now is superseded. **Owner continuation (2026-11-25):** resume
+  Phase 1 using the demo universe and explicitly demo-derived quotas. The older live-universe
+  requirement is superseded for this demo-only audit; live supply remains unverified and must
+  be checked before any future owner-authorized switch to live broker access.
+- **Owner decision on Yahoo (2026-11-22):** Yahoo stays the primary source. The owner was told
+  its [terms](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) prohibit automated
+  collection and building a database without express prior permission, including through a
+  manually started script, and accepted that risk. Never describe Yahoo data as licensed,
+  permitted or verified. Yahoo can block the server, so failure must leave old values intact.
+- **Owner decisions on selection (2026-11-22):** measure liquidity and volatility on each company's
+  verified **home exchange**, while each selected stock stays tied to its Trading 212 line. Use
+  **ECB euro reference rates** for traded-value conversion, citing the ECB and stating that values
+  are converted. ECB rates are used only for the selection gate and are not republished.
+- Validators are used only within their own current terms. If terms are unreadable or do not
+  allow the use, skip that validator.
+- Extremes use split-adjusted, **not dividend-adjusted** prices (`auto_adjust=False`, never
+  `Adj Close`). A calendar year means 1 January to date, not 52 weeks.
+- Temporary price history may be held in memory during a run and must then be discarded.
+- Keep one Gunicorn worker, four threads, the 512 MiB app limit and the existing deployment gate.
+- Reuse the current app, SQLite database and `unittest` style. Add no dependency unless a phase
+  records why it is unavoidable.
+- Each phase ends with passing checks, a summary and owner approval. No commit or push unless
+  the owner asks.
+- Do not press or run a live stock sync before Phase 5. The current sync still uses the old
+  all-stock calculation.
 
 ## 4. Current Understanding
 
 ### Verified on 2026-11-22
 
-- Stock data is in SQLite, written by `sync.py` and served by `app.py`. The in-app scheduler
-  runs on weekdays at 14:45 UTC.
-- `sync.py:212` calls `yf.Ticker(...).history(period="max", actions=False)` with
-  yfinance's default adjustment. This is the likely cause of negative lows; Phase 0 must
-  prove it.
-- The 2026-11-22 export has 9,695 rows: 309 with `all_time_min <= 0` (277 negative, 244 on
-  Frankfurt), 471 with ATH/ATL above 10,000, and 3 without year values.
-- The reported "1 row without a Yahoo symbol" is **not** present in that export.
-- `ACIC`, `GOLD`, `CNX`, `CR`, `ALAIR.PA`, `SEV` and `UA` are each shared by more than one
-  instrument, consistent with the reported wrong mappings.
-- The server has 1 CPU, 1.9 GB RAM and 33 GB free disk, shared with TradingSupport. The
-  dashboard container is limited to 512 MiB and 0.5 CPU.
-- `fix_stock_extremes.py` was not found locally or on the server. Build from this spec.
+- `sync.py` fetches Trading 212 instruments, maps Yahoo symbols, calculates metrics and upserts
+  `stocks`. `app.py` serves the dashboard and manual `POST /sync`.
+- `sync.py:212` calls yfinance `history(period="max", actions=False)` with default adjustment.
+  The export has 309 rows with `all_time_min <= 0` (277 negative, 244 on Frankfurt), 471 with
+  ATH/ATL above 10,000 and 3 without year values. It has no row without a Yahoo symbol.
+- The demo Trading 212 list has 10,371 stocks, 6,775 ETFs, 20 warrants and 9,166 unique stock
+  ISINs. Stock currencies are USD, EUR, GBX, CAD and CHF. Japan, Australia, the Nordics and
+  similar markets appear through foreign lines, so **country is the ISIN prefix**.
+- Issuers with ISIN prefixes such as KY, BM, VG, JE and GG are outside the 23 countries unless a
+  later reviewed rule maps them.
+- The live app runs release `c9bad96e9fd67e20`. **Its automatic stock scheduler is removed**; crypto
+  remains scheduled. The change is committed as `bc0bad4`.
+- `deploy/manage.py` allows only known app environment keys. Its update flow stops on schema or
+  row-count changes, so Phase 5 needs a reviewed migration.
+- `deploy/release.py` ships an explicit file list. Any new runtime module must be added to it and
+  to the `Dockerfile`.
+- README, `.env.example`, `deploy/ROLLOUT.md` and `docs/deployment.md` still describe automatic or
+  all-stock behavior. This plan wins until Phase 5 updates them.
+- The server has 1 CPU, 1.9 GB RAM and about 33 GB free disk, shared with TradingSupport.
+- WallStreetOdds is US-only and its terms on automated storage are unclear. EODHD's free plan has
+  no stock all-time fields. Neither is part of this plan.
 
-### Findings Phase 0 must confirm or refute
+### Findings Phase 1 must confirm or refute
 
-- Data stops at the Friday 2026-11-13 close; about 21% of sampled rows had a new 2026
-  low/high a week later.
-- Extremes use dividend-adjusted prices (184 of 185 sampled rows where it matters),
-  including lows that never traded (ROST 0.083) and values that drift after dividends.
+- Prices stop at the 2026-11-13 close.
+- Extremes are dividend-adjusted (reported 184 of 185 sampled rows, ROST 0.083, XEB.F about −2.8m).
 - Seven wrong Yahoo symbols: Archer Aviation ACIC→ACHR, Barrick Mining GOLD→B, Core Natural
-  Resources CNX→CNR, Crane NXT CR→CXT, Mexedia ALAIR.PA→ALMEX.PA, Sono Group SEV→SSM,
-  Under Armour Class A UA→UAA.
-- Values were not updated after later splits (LOBO is 10× too low after a reverse split).
-- Float32 storage artifacts such as `0.0010000000474974513`.
-- "Year" means calendar year to date, not 52 weeks. Keep this definition.
+  Resources CNX→CNR, Crane NXT CR→CXT, Mexedia ALAIR.PA→ALMEX.PA, Sono Group SEV→SSM, Under
+  Armour Class A UA→UAA.
+- LOBO is 10× too low after a reverse split.
+- Stored values show float32 artifacts.
 
 ### Unknown — inspect before implementation
 
-Current provider limits and terms, whether Yahoo's terms satisfy the "legitimate" rule,
-stored-bar size, rebuild duration on the shared host, the existing notifier target and
-each exchange's OpenFIGI `exchCode` and quote currency.
+Live Trading 212 list and quotas (deferred by the 2026-11-25 demo-only owner decision;
+use demo credentials in `T212_API_KEY`, `T212_API_SECRET` and `T212_ENVIRONMENT=demo` for now);
+Yahoo fields and throttling for the selected size; whether
+each quota can fill after home-exchange filters; current Massive and Alpha Vantage terms
+and non-US coverage; how yfinance's split-adjusted values behave for serial reverse splits.
 
 ## 5. Areas to Inspect
 
-`sync.py`, `app.py`, `refresh.py`, `compose*.yaml`, `Dockerfile`, `deploy/manage.py`,
-`deploy/release.py`, `deploy/data.py`, `tests/`, the live stock DB (read-only) and
-TradingSupport notifier code (read-only).
+`sync.py`, `app.py`, `refresh.py`, `templates/index.html`, `tests/test_sync.py`, `tests/test_app.py`,
+`deploy/release.py`, `deploy/manage.py`, the live stock DB (read-only) and research report
+`Volatile stock universe selection` from 2026-11-22.
 
 ## 6. Simplest Implementation Strategy
 
-### Runtime
+### Target flow
 
-Use a separate container and database in this repository, reusing the release tooling.
-The dashboard switches to verified data only after the owner approves the rebuild review.
-Only then is the old stock scheduler retired.
+1. **Monthly, manual selection:** fetch instruments, filter, score and propose up to 1,000 members.
+2. **About twice weekly, manual sync:** for approved members only, fetch history, validate, calculate
+   the five values, save them and discard history. With no approved members, the sync refuses to
+   call Yahoo.
+3. **Manual validation:** compare a rotating sample with independent providers.
 
-### Code
+At 0.5 s pacing a member sync is estimated at about 16 minutes (measured 0.93 s per stock). Selection is the larger Yahoo job because
+it needs 63 sessions for each eligible candidate.
 
-New package `stockdb/`: `schema`, `universe`, `mapping`, `providers/`, `quota`, `validate`,
-`extremes`, `pipeline`, `export`, `cli`. Add `overrides.yaml` only with a safe YAML parser;
-add no other dependency without a reason recorded in its phase.
+### Country quotas
 
-Reuse `sync.fetch_instruments`, `to_yahoo`, `EXCHANGE_COUNTRIES`, the `_Yahoo` backoff
-pattern, `refresh.py` locking/status patterns, `deploy/data.py` SQLite backups and the
-existing `unittest` style. Do not change `sync.py` behavior before cutover.
+Use the square root of MSCI ACWI IMI developed-market weights at
+[30 June 2026](https://www.msci.com/downloads/web/msci-com/research-and-insights/video/acwi-imi-complete-geographic-breakdown/oct-2026/A%20Complete%20Geographic%20Breakdown%20of%20the%20MSCI%20ACWI%20IMI.pdf),
+with the owner's US maximum of 200 and target minimum of 10 per country. Other countries are capped
+at 15% of the total and 75% of their unique ISINs, except that the owner's minimum of 10 overrides
+the 75% limit where supply allows. Quotas are ceilings. A country may be below 10 only because of
+too little supply or too few stocks passing the gates; empty seats stay empty rather than admitting
+weak stocks. Recalculate from the configured demo ISIN counts in Phase 1 using this same rule.
+These are demo quotas, not verified live-account supply or eligibility counts.
 
-### Sources (limits must be verified)
+```python
+COUNTRY_QUOTAS = {
+    "US": 200, "JP": 104, "GB": 77, "CA": 76, "FR": 62, "CH": 60, "DE": 59, "AU": 54,
+    "NL": 50, "ES": 39, "SE": 39, "IL": 26, "BE": 23, "DK": 23, "FI": 22, "NO": 19,
+    "AT": 14, "IE": 12, "SG": 12, "IT": 10, "PT": 10, "NZ": 6, "HK": 3,
+}  # Total 1,000. NZ and HK have only 6 and 3 unique ISINs in the demo list.
+```
 
-| Role | Source | Stated free limit | Use |
-| --- | --- | --- | --- |
-| Universe | Trading 212 `/equity/metadata/instruments`, `/exchanges` | 1 / 50 s; exchanges 1 / 30 s | Daily instruments |
-| ISIN mapping | OpenFIGI `/v3/mapping` | 25 requests / 6 s, 100 jobs each | New/changed instruments |
-| Main prices | Yahoo chart endpoint (unofficial) | Unpublished; at most 2–3 req/s with backoff | Bars, history, events |
-| US check | Massive grouped daily | 5 calls/min, 2 years, available after midnight ET | Every US row daily |
-| US backup/history | Tiingo EOD | 50/hour, 1,000/day | Fallback, slow verification |
-| Non-US spot checks | Alpha Vantage `TIME_SERIES_DAILY` raw | 25/day | Random EU/CA sample |
-| Optional US backup | Twelve Data Basic | 800/day, US only | Only if Tiingo is down |
+### Selection rule (starting values, calibrate on real data)
 
-Providers implement one interface: `fetch_daily(symbols, date)`, `fetch_history(symbol)`,
-`quota_left()`, and can be enabled by configuration.
+- Keep `type == "STOCK"` and one Trading 212 line per ISIN: its home-exchange line if offered,
+  otherwise its highest median EUR traded-value line. That line supplies the stored five values.
+- Resolve a separate Yahoo home-listing symbol for screening. Accept it only if ISIN or validated
+  company name, country and exchange agree. No verified home listing means the stock is ineligible.
+- Calculate all gates and RYZ63 on the home listing. Convert traded value with ECB rates. Missing FX
+  means the stock is ineligible.
+- **Phase 1 clarification (2026-11-25):** home listings need ECB rates for JPY, AUD, SEK, DKK,
+  NOK, ILS, SGD, NZD and HKD as well as the original USD, GBP, CAD and CHF. Normalize GBX/GBp
+  through GBP and ILA (agorot) through ILS at 100 minor units per major unit. Load enough FX
+  history for all 63 trading sessions; the 90-calendar-day file can be too short. Never use a
+  future FX observation. Phase 3 owns this conversion and coverage behavior.
+- A new listing needs 68 sessions: skip its first 5, then use the next 63.
+- Over 63 sessions, require at least 57 valid sessions, median traded value of at least €1m,
+  at least 90% trading days, at most 6 zero-volume days, at most 20% zero-return days and a
+  price of at least about $2. Current members use €0.75m, 85%, 9, 25% and $1.50.
+- Exclude a stock with invalid OHLC, high/low of at least 3, or an unexplained split-like jump.
+- Rank each country by RYZ63, a Yang-Zhang volatility with daily components clipped at
+  median ± 6 scaled MAD. Retain eligible current members ranked within 1.3 × the country's quota,
+  best first, then fill remaining seats by rank. Retained members count toward the quota, which is
+  never exceeded. The first selection has no current members.
 
-### Data model
+### Data changes
 
-SQLite WAL at `/data/stock_db.sqlite`:
+Extend the existing migration pattern in `sync.init_db`. Add to `stocks`: `current_price`,
+`price_date`, `isin`, `country`, `verification`, `quality_flags`. Add `universe_members`:
+`ticker`, `isin`, `country`, `rank`, `volatility`, `selected_at`. It holds approved members only;
+proposals stay in the private review file. No history table.
 
-- `instruments`: t212_ticker (PK), isin, name, type, currency, exchange, added_on,
-  first_seen, last_seen_in_t212, status (`ACTIVE`, `NEW`, `REMOVED_FROM_T212`, `NO_DATA`).
-- `symbol_map`: t212_ticker → yahoo/massive/tiingo/alphavantage symbols, method
-  (`OPENFIGI`, `MANUAL_OVERRIDE`, `NAME_SEARCH`), confidence, validated_at, provider long
-  name, name_score.
-- `daily_bars`: (t212_ticker, date, source) → open, high, low, close, volume, currency,
-  split_adjusted_as_of.
-- `corporate_actions`: splits and informational dividends per symbol, date, ratio, source.
-- `extremes`: all-time and year min/max with dates, last_close, data_through,
-  primary_source, confirmed_by, verification (`TWO_SOURCES`, `SINGLE_SOURCE`,
-  `QUARANTINED`), quality_flags.
-- `quarantine`: rejected values, reason, both sources' numbers, date; never auto-deleted.
-- `source_usage`: calls, errors, 429s and breaker state per provider per day.
-- `runs`: start/end, step results, counts and warnings.
-- A compatibility view exposes the old export columns.
+`current_price` replaces `opening_price` in dashboard values and distance calculations. Existing
+columns remain until the Phase 5 reviewed migration. Existing non-member rows are removed from
+the live table only in Phase 5, after backup and owner approval.
 
-### Mapping rules
+Verification values: `SINGLE_SOURCE`, `CONSISTENT`, `DISAGREES`. Agreement means consistency,
+not proof.
 
-Key by ISIN + Trading 212 exchange, never ticker text alone. New or changed instruments go
-through OpenFIGI, then provider-symbol construction. Before use, validate normalized name
-similarity (at least 0.5), currency, exchange and that no other ISIN uses the symbol.
-Failures become `confidence=LOW`, are excluded from extremes and are reported. Overrides
-are preloaded with the 7 corrections and still pass validation. Re-validate monthly and
-immediately on a provider name change.
+### Validation
 
-### Validation rules
+Every member must satisfy, when values exist:
+`0 < all_time_min <= year_min <= current_price <= year_max <= all_time_max`.
+A failed row keeps its last good values, is flagged and is reported. A legacy value that violates
+this rule or came from the old dividend-adjusted calculation is **not** a good value: it becomes
+missing unless a new valid value replaces it.
 
-- Reject low/high/close `<= 0`, low > high, close outside [low, high] beyond a tiny
-  tolerance, or a missing close.
-- **Bad ticks:** low below 20% of min(open, close, previous close), or high above 5×
-  max(same): repair the wick to the body, flag it and quarantine the original.
-- **US agreement:** Yahoo vs Massive close within 1%, high/low within 2% → `TWO_SOURCES`.
-  Otherwise use Tiingo as tie-breaker; if unresolved → `QUARANTINED`, keep the last good value.
-- **Non-US:** `SINGLE_SOURCE` unless confirmed by an Alpha Vantage spot check.
-- **Jumps:** close moves above 50% with no split: keep, flag `CHECK_JUMP`, verify when
-  budget allows.
-- **Splits:** providers must agree on date and ratio before history is re-adjusted. Then
-  refetch full history and recompute extremes.
-- `year_min >= all_time_min`, `year_max <= all_time_max`, and `data_through` must be a
-  trading day of that exchange.
-- ATH/ATL above 10,000 is allowed but flagged `EXTREME_RANGE`.
-
-### Fallback and quota
-
-Persist calls per day/hour/minute and stop before the limit, with a 10% margin. US order:
-Yahoo, Massive, Tiingo, Twelve Data. Non-US order: Yahoo, Alpha Vantage if budget remains,
-otherwise keep the last value and mark `STALE`. After N consecutive failures or any 401/403,
-skip that provider for the run and report it. One failed source never stops the whole run.
-
-### Daily pipeline (about 06:30 Europe/Berlin)
-
-1. Lock and record a `runs` row.
-2. Update the universe; mark new, removed, renamed and re-listed instruments.
-3. Map new or changed instruments.
-4. Backfill new instruments and new splits within a budget, so the normal update finishes.
-5. Fetch every missed trading day since `data_through`; US rows also from Massive.
-6. Validate, write bars and recompute extremes incrementally (full recompute only after a
-   split or corrected bar).
-7. Run fallback for failed symbols.
-8. Spend remaining Tiingo/Alpha Vantage budget on spot checks, prioritizing never-checked and
-   changed rows.
-9. Write the report and backup.
-
-The pipeline must be idempotent and restart-safe at every step.
-
-### Outputs and operations
-
-- Daily `stocks_export_<date>.csv`: old columns plus currency, all_time_min_date,
-  all_time_max_date, year_min_date, year_max_date, last_close, data_through, primary_source,
-  confirmed_by, verification, quality_flags, isin.
-- Daily Markdown report and short notifier message (email if no notifier exists): totals,
-  new/removed, rows updated, verification and stale counts, calls per provider, providers
-  down and top quarantined rows.
-- Alert when a run fails or more than 5% of rows are stale.
-- Backup after every successful run, keeping 14 daily + 8 weekly.
-- Health command: last successful run, `data_through` distribution, quota left per provider.
-- Configuration uses `SDB_` variables: `DB_PATH`, `T212_API_KEY`, `T212_API_SECRET`,
-  `T212_BASE`, `OPENFIGI_API_KEY`, `MASSIVE_API_KEY`, `TIINGO_API_KEY`, `ALPHAVANTAGE_API_KEY`,
-  optional `TWELVEDATA_API_KEY`, `RUN_TIME`, `TIMEZONE_USER`, `NOTIFIER_TARGET`. A missing
-  required key gives one clear error naming the variable.
-- Documentation: `README.md`, `SOURCES.md`, `AUDIT.md`, `REBUILD_REPORT.md`, `DATA_QUALITY.md`.
-
-### Definition of done
-
-- Every Trading 212 instrument is in the DB or reported with why it has no data.
-- No value `<= 0`, no dividend-adjusted extremes, no `confidence=LOW` mapping used for
-  extremes, and the 7 known wrong mappings are fixed.
-- Every active US row with data in Massive's 2-year window is `TWO_SOURCES`, or is listed
-  with a reason (`QUARANTINED`, `STALE`, no second-source data).
+Massive may check US current prices with one grouped-daily call. Alpha Vantage may check about 22
+non-US current prices per day after its terms are confirmed. All-time values remain Yahoo-only.
+With validation run only on two sync days, a full 800-stock non-US rotation takes about 18 weeks;
+if the manual validation command is run daily, it takes about 5 weeks.
 
 ## 7. Security Considerations
 
-Secrets stay in ignored env files, with no key in logs, reports or fixtures. Provider data is
-untrusted: use parameterized SQL, escape CSV formulas and validate symbols before building
-URLs. Add no public control route or Docker socket in the app. Raw data and exports stay
-private; `docs/stocks_export_2026-11-22.csv` should not be committed if data must stay
-unpublished.
+Keep secrets in ignored env files and out of logs, reports and fixtures. Treat provider and
+Trading 212 text as untrusted: use parameterized SQL, template escaping, CSV formula escaping and
+validated symbols. Manual stock sync stays behind login and CSRF. Selection and validation are
+CLI-only, with no public maintenance route or Docker socket. Local exports stay private and Git-ignored.
 
 ## 8. Implementation Phases
 
-### Phase 0: Inspect the project and audit current data
+### Phase 0: Stop automatic stock sync on the server
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** None
 
 #### Goal
 
-Produce evidence-based `AUDIT.md` and draft `SOURCES.md`, the input for later phases.
+The server no longer starts a stock sync by itself, while manual stock sync and crypto keep working.
 
 #### Scope
 
-Read-only inspection of code and data, plus those two documents.
+The changes in `app.py` and `templates/index.html`, committed as `bc0bad4`, one manual update and
+live verification.
 
 #### Do Not Change
 
-Application code, databases, schedules or the server.
+Stock data, sync logic, crypto schedule, proxy, TradingSupport services or server environment.
 
 #### Reuse First
 
-Existing DB, export and `sync.py` mapping tables.
+`deploy/update.sh`, including its drain, backup, health check and rollback.
 
 #### Steps
 
-1. Inspect engine, schema, row writes, Yahoo calls, mapping, status, scheduling and deployment.
-2. Confirm or refute every section 4 finding with counts and example rows.
-3. Map each exchange to Yahoo suffix, OpenFIGI `exchCode` and currency, including GBp.
-4. Read current provider docs and terms. If Yahoo's terms conflict with the "legitimate"
-   rule, stop for an owner decision.
-5. Estimate stored-bar size and rebuild time from a small sample; propose resource limits.
+1. Confirm no job is running.
+2. Operator runs `bash deploy/update.sh` before 2026-11-23 14:45 UTC.
+3. Verify the deployed code, status, data counts and other services.
 
 #### Acceptance Criteria
 
-- Every finding is marked confirmed or refuted, with evidence.
-- The exchange table covers every exchange in the DB.
-- Provider limits and terms are recorded with source links and check dates.
-- Sizing and proposed limits are recorded.
+- The running app has no stock scheduler thread and the dashboard says "manual only".
+- ~~No scheduled stock attempt appears after 2026-11-23 14:45 UTC.~~ **Waived by owner on 2026-11-22;
+  not observed.** Running code has no stock scheduler.
+- Manual sync route remains protected by login and CSRF.
+- Crypto remains scheduled; row counts and TradingSupport container IDs are unchanged.
 
 #### Verification
 
-Rerun the audit queries against a read-only connection and confirm matching counts. Confirm
-`git diff` contains only the new documents.
+Local dry run, deployment tests and production checks passed on 2026-11-22. After deployment, use
+read-only container inspection, refresh status, logs and row-count queries.
 
 #### Security Check
 
-Confirm no secret, key or credential appears in either document or sampled output.
+Confirm no new route, published port, secret output or weakened form protection.
 
-### Phase 1: Build schema, Trading 212 universe and validated mapping
+#### Execution Evidence (2026-11-22)
 
-**Status:** Not Started
+- `bash deploy/update.sh` completed at about 14:38 UTC with packaged offline application tests.
+  Live release is `c9bad96e9fd67e20`, started `14:38:23Z`, healthy, `unless-stopped`, with no
+  published ports. Backup: `backups/20261122T143815-16bb99e4`.
+- Running code has 0 stock scheduler starts and 1 crypto scheduler start. The Stocks page says
+  "manual only" and shows no next run; the Crypto page still shows its next scheduled run.
+- Stocks 9,695 and crypto 18,311 rows are unchanged; all three SQLite integrity checks are `ok`.
+  Stock refresh state is still `never`. Crypto next due is `2026-11-23T02:00:00Z`.
+- Without credentials, `/`, `/health`, `POST /sync` and `POST /sync/crypto` return 401. Port 8000
+  has no host listener. A valid-login manual sync was deliberately not run.
+- All five TradingSupport container IDs are unchanged. `engine` shows a new start time of
+  `2026-11-22T10:39:15Z`, about four hours before this update and with the same container ID;
+  this update did not cause it.
+- The stored stock `due_at` remains but no thread reads it.
+
+#### Review Result (2026-11-22)
+
+- **Done — Passed Review by owner instruction.** The app diff removes only the stock scheduler
+  start. Running code has 0 stock scheduler starts, no stock sync started in the logs after
+  release, and no app timer or cron entry exists.
+- The owner accepted closing the phase before `2026-11-23T14:45:00Z`, so the observation that no
+  attempt occurs at that time was **not run**.
+
+### Phase 1: Audit current data and confirm the demo universe
+
+**Status:** Done — Passed Review
 **Depends on:** Phase 0
 
 #### Goal
 
-Store every Trading 212 instrument with a validated provider mapping.
+Produce evidence in `docs/AUDIT.md` and `docs/SOURCES.md` for every later phase.
 
 #### Scope
 
-`stockdb` schema, universe, mapping, overrides, config validation and tests.
+Read-only code and data inspection, a small read-only Yahoo sample, and those two documents.
 
 #### Do Not Change
 
-Existing `stocks` data, `sync.py` behavior, dashboard or schedules.
+Application code, databases, schedules or server configuration.
 
 #### Reuse First
 
-`sync.fetch_instruments`, `to_yahoo`, `EXCHANGE_COUNTRIES` and existing test style.
+Existing DB, `sync.py` mappings and the 2026-11-22 research report.
 
 #### Steps
 
-1. Create the schema with 8-byte numeric storage and WAL.
-2. Implement universe updates and OpenFIGI mapping keyed by ISIN + exchange.
-3. Implement validation and preload the 7 overrides.
-4. Add recorded-fixture and regression tests.
+1. Confirm or refute every section 4 finding with counts and examples.
+2. Fetch the demo Trading 212 list using read-only metadata requests and recalculate ISIN counts
+   and demo quotas. **Superseded by the demo-only owner decision:** the earlier requirement to
+   fetch live-account metadata in Phase 1. Broader demo key permissions do not authorize orders.
+3. Map countries, exchanges, Yahoo suffixes and currencies, including GBX.
+4. Check Massive, Alpha Vantage and FX-source terms and coverage.
+5. Sample Yahoo to measure runtime, memory, raw/split-adjusted fields and filter pass rates.
 
 #### Acceptance Criteria
 
-- Every fixture instrument is stored or reported with a reason.
-- All 7 known mappings resolve correctly through validation.
-- A failed mapping becomes `LOW` and cannot be selected for extremes.
-- The old database is byte-identical after a run.
+- Every finding is marked confirmed or refuted with evidence.
+- The demo quota table totals at most 1,000, has US at most 200 and shows each country's demo
+  supply. Label the table demo-derived; do not present it as live-account verification or as
+  proof that quotas will fill after home-exchange filters. The older live-table requirement
+  is superseded for Phase 1 by the demo-only owner decision.
+- Every country below 10 is listed with the reason.
+- The FX source is approved, or the blocker is recorded.
+- Each provider has limits, terms, source links and check date recorded.
 
 #### Verification
 
-Run the full `unittest` suite in an isolated container with dummy keys and no network.
+Rerun audit queries on a read-only connection and confirm matching counts. This phase's changes are
+limited to the two new documents and this plan.
 
 #### Security Check
 
-Confirm parameterized SQL, safe YAML loading, and no credentials in logs or fixtures.
+Confirm neither document or sampled output contains a key, secret or credential.
 
-### Phase 2: Add providers, quota manager and circuit breakers
+#### Execution Evidence (2026-11-22)
 
-**Status:** Not Started
+- `docs/AUDIT.md` written: every section 4 finding marked confirmed/refuted with evidence;
+  CSV audit re-run reproduces 309 rows with `all_time_min <= 0` (277 negative, 244 Frankfurt),
+  389 with ATH/ATL > 10,000, 3 without year values, 0 without a Yahoo symbol; float32 artifact
+  examples recorded; XEB.F (−2,816,771.75) and ROST (0.0833) dividend-adjustment confirmed via
+  live Yahoo sample vs split-adjusted (`auto_adjust=False`) values 4.63 and 0.1133.
+- `docs/SOURCES.md` written: Yahoo, Trading 212, Massive, Alpha Vantage and FX-source limits,
+  terms, source links and check dates recorded; no key values present.
+- Trading 212 demo fetch succeeded: 17,166 instruments (10,371 STOCK / 6,775 ETF / 20 WARRANT),
+  9,166 unique stock ISINs, matching the plan's demo description; country supply and quota
+  table calculated (totals 1,000, US 200; NZ supply 6 and HK supply 3 below 10 due to supply).
+- Full unittest suite passes: 187 tests OK.
+- Blockers recorded: `T212_ENVIRONMENT=demo` (Phase 1 requires `live` + live keys); no FX source
+  approved yet; latest Yahoo price-close date not yet confirmed.
+
+#### Review Result (2026-11-22)
+
+**Review Failed.** No security blocker was found. Only this review record was added.
+
+Reproduced: 9,695 rows, 309 at or below 0 (277 negative, 244 Frankfurt), 3 without year values,
+0 without a Yahoo symbol, 17,166 demo instruments, 9,166 unique stock ISINs, 63 prefixes, 8,244 ISINs
+in the 23 countries and all country and currency counts. **187 unittests passed** in an isolated
+container with no network. Live release is `c9bad96e9fd67e20`, with 0 stock scheduler starts, 1 CPU,
+1.9 GB RAM and 33 GB free. Yahoo samples were not rerun.
+
+Blocking:
+
+1. **Finding 4.4 is wrongly refuted.** The finding is the ATH/ATL **ratio** above 10,000, which
+   reproduces at **471**. The audit counted individual values above 10,000 (389).
+2. **Findings A, C and D are neither confirmed nor refuted.** Price end date, all seven symbol
+   mappings and LOBO can be checked with a small Yahoo sample and do not depend on the live list.
+   The CSV shows each of the seven symbols is shared by two instruments, but that is not proof.
+3. **The live Trading 212 list was not fetched,** so final supply and quotas are not established.
+4. **Step 5 is incomplete.** Runtime and memory were not measured, filter pass rates are absent, and
+   two symbols do not reproduce the reported 184 of 185 result.
+5. **`docs/AUDIT.md` contradicts itself.** It says no country is below 10 in supply and that NZ/HK
+   supply is not exhausted, while showing NZ 6 and HK 3 with quotas equal to all supply.
+6. **Some statuses lack evidence.** Finding 4.14 is "Confirmed" while "Not re-inspected", and 4.15 is
+   unverified although read-only server access exists.
+7. **`docs/SOURCES.md` is incomplete.** FX terms are unconfirmed; Alpha Vantage storage is not answered;
+   Massive's deletion within 30 days after the licence ends is missing; the Yahoo terms are labeled
+   "owner-reviewed" without a record; and the Twelve Data, Finnhub and FMP exclusion reason is unsupported.
+
+Optional: remove placeholder tickers `XYZm_EQ` and `ABCz_EQ` from the section labeled as confirmed
+against demo tickers, and delete or restrict `/tmp/t212_instruments.json` (mode 0664; instrument
+metadata). A pattern scan of the two audit documents found no credentials.
+
+#### Rework Evidence (2026-11-22)
+
+- All blocking review items that do not need owner input are fixed in `docs/AUDIT.md` and
+  `docs/SOURCES.md`. Findings 4.4, A, B, C and D are confirmed with evidence.
+- Yahoo sample: 418 ISINs across 23 countries, 363 with data, 0 exceptions, 390.5 s, 146.6 MiB peak.
+  104 passed all gates. 249 failed the EUR 1m liquidity gate.
+- Likely unfilled quotas with the current rule: JP, DE, AU, SE, DK, FI, NO, SG, IT, NZ, HK. In a German test of 30 stocks, 0
+  passed through `.F` and 8 through `.DE`, so the current Frankfurt measurement needs an owner decision.
+- ECB and Massive terms were read, and Alpha Vantage's PDF text was extracted.
+- Full suite last run: 187 tests passed in an isolated container with no network.
+- **Owner decisions (2026-11-22):** use the home exchange for liquidity and volatility; ECB approved.
+- **Rework continuation (2026-11-25):** demo supply, quotas and the home-exchange sample are now
+  checked as recorded below. Historical live-key blockers are superseded for this demo audit
+  and do not authorize live access. The phase awaits review.
+
+#### Continuation Evidence (2026-11-25)
+
+- Owner requested demo only, then resumed Phase 1. Updated this phase's title, steps and quota
+  criterion accordingly; no live broker access, orders, application changes or production writes.
+- Local demo metadata GET returned HTTP 200: 17,162 instruments, 10,371 stocks, 9,166 unique stock
+  ISINs and 8,246 in the 23 selected countries. Demo quotas recalculated from the cited MSCI
+  weights and current supply still total 1,000, US 200; NZ 6 and HK 3 are limited by supply.
+- CSV and read-only server SQLite counts reproduce 9,695 rows, 309 nonpositive lows (277 negative),
+  471 ATH/ATL ratios above 10,000 and 3 missing year ranges. Server integrity is `ok`; no stock
+  scheduler start remains in running app source.
+- Completed-session home-exchange probe: 45 selected ISINs across 23 countries, 155.88 s,
+  233.26 MiB peak in a 512 MiB / 1 CPU container. Initially 42 passes, 1 exclusion and 2 unavailable
+  symbols. Issuer/exchange-backed follow-up verified ROP.SW and A5G.IR (7.56 s, 233.64 MiB),
+  bringing this selected sample to 44 passes; AIR.NZ fails liquidity, price and zero-return gates.
+  This is not a representative sample or proof that country quotas will fill.
+- Home screening requires 13 ECB currencies plus GBX/GBp and ILA unit normalization. The full FX
+  history resolves the 90-day file's insufficient coverage of some 63-session windows. These
+  requirements are assigned to Phase 3; completed price-session handling belongs to Phase 2.
+- Additional Roche mapping evidence: T212 `ROGs_EQ`, ISIN `CH1499059983`, corresponds to ROP,
+  not the discontinued ROG symbol; preserve the distinction from bearer share RO. A5G.IR is
+  the verified AIB Dublin screening symbol. Evidence and primary-source links are in the audit.
+- Split-only probes: LOBO and TBT each have one reverse split; diagnostic ETF SQQQ has eight.
+  Positive lows and near-continuous split-date closes support that provider history is already
+  split-adjusted. They do not prove every historic extreme; do not double-apply split factors.
+- All 187 unittests passed in 3.638 s in a read-only container with no network, dummy keys and
+  temporary databases. Quota bounds, the planned quota dictionary, sample identities, session
+  counts, FX coverage and the eight-split aggregate passed direct consistency checks.
+- Literal configured-secret scan of all three documents and temporary audit artifacts found no
+  credentials. Env files remain 0600 and ignored; current audit data is 0600 in a 0700 directory.
+  `git diff --check` passed. No security issue was identified in this documentation-only change.
+- Updated `docs/AUDIT.md`, `docs/SOURCES.md` and this plan. **Ready for Review**, not passed review.
+  Live broker supply, full candidate screening and later-phase implementations remain unverified.
+
+#### Review Result (2026-11-25)
+
+**Done — Passed Review.** Reviewed the whole active plan for consistency with the demo-only
+owner decision, the actual plan diff, both audit documents, current application code and the
+private metadata/sample artifacts. No blocking findings or credible security issues were found.
+
+| Acceptance criterion | Review evidence | Result |
+|---|---|---|
+| Findings confirmed or refuted with evidence | Rechecked code references and CSV counts; independently fetched company metadata for the seven ticker-mismatch pairs. Under Armour's issuer FAQ confirms UAA = Class A and UA = Class C. Historical price/date and adjustment samples are explicitly dated; new LOBO/serial-split evidence is retained in the audit. | Passed |
+| Demo quota table and country supply | Independently recomputed square-root allocations from the metadata and cited MSCI weights, including bounds and largest remainders; compared with both the audit table and plan dictionary. Supply 8,246; quotas 1,000; US 200. | Passed |
+| Countries below 10 explained | NZ supply/quota 6 and HK 3; no other quota is below 10. Neither table claims the quotas will fill after screening. | Passed |
+| FX approved or blocker recorded | ECB owner approval is explicit. Full-window FX, 13 currencies and GBX/GBp/ILA conversions agree with the probe and are assigned to Phase 3. | Passed |
+| Provider limits, terms, sources and dates | Source document records the required details and uncertainties. Rechecked Alpha Vantage terms/25-call allowance and Massive personal-use/deletion terms against primary sources. Future validator use remains subject to Phase 4's terms check. | Passed |
+
+- Fresh read-only server SQLite queries reproduce 9,695 rows, 309 nonpositive lows, 277 negative
+  lows, 471 ATH/ATL ratios over 10,000 and 3 missing year ranges; integrity `ok`, latest update
+  `2026-11-15 09:48:45`, no stock scheduler starts in running source. CSV counts agree.
+- All 187 unittests passed again in 3.630 s in the isolated, read-only, network-disabled container
+  with dummy keys and temporary databases. No application, database or server configuration changed.
+- Reviewed aggregate sample evidence: 45 identities across 23 countries, 63 valid sessions and
+  complete FX for each, 44 basic-probe passes after the two verified symbol corrections.
+  The report correctly discloses selection bias and incomplete production-screen coverage.
+- Literal and encoded configured-credential scan passed for the documents and retained artifacts;
+  env/data permissions passed. `git diff --check` passed. No runtime files are in the diff.
+- Review limits: did not rerun the historical 418-stock price sample or a full candidate screen,
+  inspect the provider-side IP allowlist, exercise order permissions or use a live brokerage key.
+  None is claimed as newly verified. No optional finding prevents acceptance of this audit.
+- Phase 2's dependency is now satisfied; no later phase was started. The plan remains active
+  because Phases 2–6 are unfinished.
+
+### Phase 2: Correct the five stored values
+
+**Status:** In Progress — owner-approved amendment (2026-11-26): US Yahoo symbols from Trading 212 `shortName`
 **Depends on:** Phase 1
 
 #### Goal
 
-Fetch from each free provider safely behind one interface.
+A sync calculates correct all-time, current and year values and never overwrites good data with
+invalid data.
 
 #### Scope
 
-Yahoo, Massive, Tiingo and Alpha Vantage plug-ins, optional Twelve Data, quota and breakers.
+`sync.py`, `refresh.py` stock staleness, schema migration, symbol overrides confirmed in Phase 1,
+stock dashboard fields and focused tests.
 
 #### Do Not Change
 
-Live data, the old sync and provider account arrangements.
+Universe selection, crypto behavior, deployment or live data.
 
 #### Reuse First
 
-The `_Yahoo` pacing/backoff pattern and `requests`.
+`compute_metrics`, `_Yahoo`, `_upsert`, `init_db`, `yahoo_symbols` and existing tests.
 
 #### Steps
 
-1. Reconfirm each provider's docs before coding it.
-2. Implement parsers using unadjusted or split-only prices as required.
-3. Persist usage, honor `Retry-After` and keep the 10% margin.
-4. Add breakers, fallback order and fixture tests.
+1. Request `auto_adjust=False` and use split-adjusted OHLC only.
+2. Store `current_price` and `price_date` from the latest valid session.
+   Exclude an unfinished current-day bar and discard event-only rows with no OHLC before
+   choosing that session; an action row is not a price observation.
+3. Reject impossible bars, enforce the ordering rule and retain last good values on failure.
+4. Add overrides with name validation and quality flags.
+5. Show `current_price` and `price_date`, and mark stock data stale when the last successful manual
+   sync is older than 7 days.
+6. Add regression tests.
 
 #### Acceptance Criteria
 
-- No request is sent once a provider's safety limit is reached.
-- A 401/403 disables that provider for the run while others continue.
-- Yahoo parsing never uses dividend-adjusted values for extremes.
+- Dividend-adjusted fixtures cannot produce negative or non-traded lows.
+- XEB.F, TBT.F, ROST, LOBO and every override confirmed in Phase 1 pass regression tests.
+- A failed or empty Yahoo response leaves previous valid values unchanged and flags the row.
+- A legacy invalid value is not retained as good data.
+- Stock staleness no longer depends on a weekday schedule. Crypto status is unchanged.
+- Year values use the calendar year; float64 values are preserved.
+- No price history is written to the database.
 
 #### Verification
 
-Run fixture tests with no live calls, then the full suite.
+Run the full `unittest` suite in an isolated app-image container with dummy keys, temporary
+databases and no network.
 
 #### Security Check
 
-Confirm fixed HTTPS hosts, encoded symbols and no key in URLs written to logs or errors.
+Confirm parameterized SQL, safe symbol handling and no raw provider error text in stored status.
 
-### Phase 3: Validate data and produce the reviewed rebuild
+#### Review Result (2026-11-26)
 
-**Status:** Not Started
+**Review Failed.** No credible security issue found (SQL parameterized, symbols from a fixed
+table, no provider text stored). 197 unittests pass on the host; the required isolated,
+network-disabled container run was not performed. No execution evidence or status change
+was recorded before review.
+
+Blocking:
+
+1. `templates/index.html`: stock header is Price, Date, Year High…, but cells render the price
+   date after All-Time Low, so every stock column from Date onward is misaligned.
+2. `sync._sync_one`: when the stored row is legacy-invalid and the new fetch fails or is
+   invalid, nothing is written, so the legacy invalid values stay and the row is not flagged.
+   Fails "legacy invalid value is not retained" and "failed response flags the row".
+   Invalid new values with no stored row also return `"ok"`, inflating the summary.
+3. `SYMBOL_OVERRIDES`: name check is a substring test (comment claims token match). "Barrick
+   Gold" will not match the Trading 212 name "Barrick Mining", so that override silently falls
+   back to the wrong symbol. Under Armour is resolved by ticker, but Phase 1 found only the ISIN
+   distinguishes Class A (`US9043111072`) from Class C; key or validate it by ISIN.
+   A failed name check must flag the row rather than silently use the old mapping.
+4. Missing regression fixtures for XEB.F, TBT.F, ROST and LOBO (the negative-low test uses a
+   synthetic all-invalid frame) and no test that overrides are actually applied in `run_sync`.
+5. New status tags `STALE` and `INVALID_VALUES` are not accepted by `app.STATUS_PATTERN` and get
+   the grey badge; filtering by them is impossible.
+
+Optional: `country` is read from a nonexistent `inst["country"]` (plan: ISIN prefix);
+`numeric_cols` one-liner in `app.py` is hard to read; dropping any bar dated today in UTC
+also drops completed sessions in Asia/Europe after close (conservative, acceptable).
+
+#### Rework Evidence (2026-11-26)
+
+All five blocking review findings were addressed; ready for re-review, not passed.
+
+1. Template: stock rows render Price then Date, matching the header; a test checks cell order.
+2. `_sync_one` now has one fallback path. No data or invalid new values keep last good values,
+   or clear stored values that break the ordering rule (legacy values become missing), and
+   always flag the existing row (`STALE`/`NO_DATA` or `INVALID_VALUES`/`INVALID`). No row is
+   created without valid values. Invalid results count as `invalid` in the summary, shown on
+   the dashboard, not `ok`.
+3. Overrides use the exact Trading 212 names from the 2026-11-22 export ("Barrick Mining",
+   "Under Armour (Class A)"); Under Armour also requires ISIN `US9043111072`. The Mexedia key
+   was wrong (`ALAIR_PA_EQ`); Trading 212 uses `ALAIRp_EQ`. A mismatched override fetches no
+   prices, never falls back to the old symbol and flags an existing row `OVERRIDE_MISMATCH`.
+4. Added run_sync regression tests for XEB.F, TBT.F, ROST and LOBO through a fake provider that
+   returns dividend-adjusted OHLC unless `auto_adjust=False`. They assert every call disables
+   adjustment and the stored values are the split-only ones. Fixture values come from the audit;
+   they are synthetic frames, not recorded provider data. Added tests showing overrides are
+   applied, mismatches are refused, and legacy invalid rows are cleared.
+5. `STALE` and `INVALID_VALUES` are accepted by `STATUS_PATTERN`, selectable as stock filters
+   and shown with a warning badge.
+
+Also fixed the optional findings: `country` is the ISIN prefix, and `numeric_cols` is simplified.
+Verification: 209 unittests passed on the host and in the app image (`--network none`,
+`--read-only`, tmpfs, dummy keys, `DB_PATH`/`CRYPTO_DB_PATH` in `/tmp`; the default `/data`
+is not writable by the image user). `git diff --check` passed. Security: SQL stays
+parameterized, override symbols come from a fixed table, stored flags are fixed strings,
+logs name only the ticker, the container could not read env files, and no history is stored.
+
+#### Re-review Result (2026-11-26)
+
+**Review Failed.** All five earlier blocking findings are fixed and verified (cell order, legacy
+clearing and flagging, exact name/ISIN overrides including `ALAIRp_EQ`, provider regression
+tests, new status filters). 209 tests pass in the isolated image. No security issue found.
+Note: the same agent session implemented the rework, so this is not an independent review.
+
+Blocking:
+
+1. `sync.compute_metrics` compares the last bar's exchange-local date with today's **UTC** date.
+   Between about 22:00 and 24:00 UTC, Australian and New Zealand bars are already dated the next
+   local day, so a still-trading bar is kept. Reproduced: Sydney-indexed history with
+   `now = 2026-11-24 23:30 UTC` (10:30 local, market open) stored `price_date` 2026-11-25. Fails
+   step 2 ("exclude an unfinished current-day bar"). Fix: use today in the index's own time
+   zone (`datetime.now(last_idx.tz)` when tz-aware), and add a test for this case.
+
+Optional: `test_crypto_staleness_unchanged_by_stock_rule` checks only the schedule label, not the
+crypto `stale` value; stock status still reports a weekday `schedule`/`next_run` although stock
+sync is manual-only (Phase 0 area, not a Phase 2 criterion).
+
+#### Rework Evidence 2 (2026-11-26)
+
+Fixed the re-review blocker. `compute_metrics` now compares the last bar's date with today in
+that bar's own exchange time zone (UTC only for a tz-naive index), so an Australian or New
+Zealand session still trading after 22:00 UTC is dropped. Same-day bars are still dropped after
+the close by design (conservative). New tests: Sydney bar at 23:30 UTC is excluded; a New York
+bar dated the previous local day is kept. 211 unittests passed on the host and in the isolated
+image (`--network none`, `--read-only`, tmpfs, dummy keys, databases in `/tmp`);
+`git diff --check` passed. No new security-sensitive behavior.
+Optional re-review notes were not changed.
+
+#### Re-review Result 2 (2026-11-26)
+
+**Review Failed.** The time-zone blocker is fixed and tested (Sydney bar at 23:30 UTC excluded,
+previous-day New York bar kept); 211 tests pass in the isolated image; no security issue found.
+Same-session review, not independent.
+
+Blocking:
+
+1. Acceptance criterion "A failed or empty Yahoo response leaves previous valid values unchanged
+   and flags the row" is met only for empty/no-data responses. A request that raises on every
+   retry pass (for example `ConnectionError`) is listed in `failed_tickers`, but its row is not
+   flagged. Reproduced: an existing valid `BPl_EQ` row stayed `ACTIVE` with no `quality_flags`
+   after four failed passes. Legacy invalid values in such a row are also left in place, which
+   conflicts with "A legacy invalid value is not retained as good data". Fix: after the final
+   pass, apply the existing fallback (keep or clear and flag, e.g. `STALE` / `FAILED`) to each
+   still-failing ticker with a stored row, and add a test.
+
+#### Rework Evidence 3 (2026-11-26)
+
+- Tickers still failing after every retry pass now go through the same fallback as no-data
+  responses (`_keep_last_good`): good values kept, invalid or legacy values cleared, row flagged
+  `STALE` / `FAILED`, no new row created. The test covers a kept row, a cleared legacy row and an
+  instrument without a row.
+- Removed unreachable leftover code from the first rework at the end of the old `_sync_one`
+  (it referenced an undefined `existing`). The `run_sync` docstring now lists `invalid`.
+- 212 unittests passed on the host and in the isolated image (`--network none`, `--read-only`,
+  tmpfs, dummy keys, databases in `/tmp`); `git diff --check` passed.
+
+#### Final Review Result (2026-11-26)
+
+**Done — Passed Review.** Full Phase 2 diff re-read (`sync.py`, `app.py`, `refresh.py`,
+`templates/index.html`, tests). **Limitation:** the same agent session implemented and reviewed
+this phase; an independent review by the owner or a fresh session is recommended before Phase 5.
+
+| Acceptance criterion | Evidence | Result |
+|---|---|---|
+| Dividend-adjusted fixtures cannot produce negative or non-traded lows | Every Yahoo call sends `auto_adjust=False`; the fake provider returns adjusted OHLC otherwise; impossible bars are rejected | Passed |
+| XEB.F, TBT.F, ROST, LOBO and all Phase 1 overrides pass | Full run_sync tests on audit-based synthetic frames; 7 overrides with exact T212 names, Under Armour ISIN, mismatch refusal | Passed |
+| Failed or empty response keeps previous valid values and flags the row | No data → `STALE`/`NO_DATA`; failing every pass → `STALE`/`FAILED`; invalid → `INVALID_VALUES` | Passed |
+| Legacy invalid value not retained as good data | Values that break the ordering rule are cleared on every fallback path | Passed |
+| Stock staleness is 7 days; crypto unchanged | `refresh.status` tests; crypto keeps its schedule rule and `opening_price` | Passed |
+| Calendar year; float64 preserved | `index.year == year`; Python float test, LOBO 57.900001525878906 kept | Passed |
+| No price history written | Only `stocks` and `yahoo_symbols` tables; history discarded after `compute_metrics` | Passed |
+
+Security: parameterized SQL, override symbols from a fixed table, fixed-string flags, logs name
+only the ticker, no provider text stored; no issue found. Optional, not blocking: the crypto
+staleness test checks only the schedule label; the stock status still shows a weekday schedule
+(Phase 0 area); `current_year` uses server-local time.
+
+### Phase 3: Select the 1,000-stock universe
+
+**Status:** Blocked — owner decision needed: stale Trading 212 tickers break symbol mapping in Phase 2 sync and Phase 3 selection
 **Depends on:** Phase 2
 
 #### Goal
 
-Build correct values and let the owner review changes before anything replaces old values.
+A manual selection command produces a reviewable list of top-volatile stocks by country.
 
 #### Scope
 
-Validation, quarantine, extremes, resumable rebuild, `REBUILD_REPORT.md`, `DATA_QUALITY.md`.
+Selection logic in the smallest suitable existing or new local module, `universe_members`, a CLI
+command, a private CSV review file, member-only sync code, release/Dockerfile entries for any new
+module and tests.
 
 #### Do Not Change
 
-Live dashboard values and the old stock table.
+Live membership, dashboard contents or the server until the owner approves the list in Phase 5.
 
 #### Reuse First
 
-`deploy/data.py` backups and Phase 1–2 modules.
+`fetch_instruments`, `_Yahoo` pacing and ISIN lookup, `refresh.job_guard` locking, Phase 1 quotas and
+ECB rates.
 
 #### Steps
 
-1. Implement validation rules and extremes with dates.
-2. Fetch Yahoo history within limits, resumably.
-3. Load 2 years of Massive grouped daily bars and cross-check US rows.
-4. Start the slow Tiingo verification and track progress.
-5. Report old vs new values, change reasons and quarantined rows.
+1. Build candidates by ISIN and country, keeping one Trading 212 line.
+2. Resolve and validate each home-exchange listing.
+3. Fetch 63 home-listing sessions with resumable progress, then discard them after scoring.
+4. Apply ECB conversion, gates, RYZ63, quotas and the 1.3× membership buffer.
+5. Write a private review CSV with Trading 212 line, home listing, reasons for exclusions and
+   unfilled seats.
+6. Restrict `run_sync` to approved members and refuse to call Yahoo when none exist.
 
 #### Acceptance Criteria
 
-- Regression tests pass for XEB.F, TBT.F, UA/UAA, GOLD/B, LOBO, float precision, year
-  definition, bad-tick wick and Yahoo/Massive disagreement.
-- No stored extreme is `<= 0`.
-- The rebuild resumes after interruption without duplicate bars.
-- **The owner approves the changed rows** before any replacement.
+- The output has at most 1,000 unique ISINs, at most 200 US and no ETF, warrant or fund.
+- Every country is at or below quota. Any country below 10 has a stated supply or filter reason.
+- Bad-tick, illiquid, duplicate-listing, IPO and reverse-split fixtures are handled as specified.
+- Rerunning with the same fixtures gives the same list.
+- Interrupting a run does not change current membership.
+- Liquidity and volatility come from a verified home listing; an unverified listing is ineligible.
+- Every selected stock remains mapped to a tradable Trading 212 line.
+- Missing ECB FX makes a stock ineligible. All home-listing currencies above are supported;
+  GBX/GBp is converted through GBP and ILA through ILS without a 100-fold unit error. FX history
+  covers the entire screening window without future-date rates.
+- A retained member never pushes a country above its quota.
+- A sync updates approved members only. With none, it makes no Yahoo request.
 
 #### Verification
 
-Run the full suite, sample-recompute extremes from stored bars and compare against the report.
+Run unit tests with fake providers, then one owner-approved real selection in an isolated
+environment with no live database writes, measuring runtime and peak memory.
 
 #### Security Check
 
-Confirm reports contain no secrets and CSV output escapes formula text.
+Confirm selection has no public route, review files are private and CSV text is escaped.
 
-### Phase 4: Deploy the daily pipeline and switch to verified data
+#### Review Result (2026-11-26)
+
+**Blocked — Security**, with additional functional blockers. Reviewed the uncommitted diff
+(`universe_select.py`, `tests/test_universe_select.py`, `sync.py`, `Dockerfile`,
+`deploy/release.py`). 250 unittests pass on the host; the plan's isolated run and the
+owner-approved real selection were not performed. The phase was never set to In Progress and
+has no execution evidence.
+
+Security (confirmed by code inspection):
+
+1. `write_review_csv` writes Trading 212 names, tickers and other provider text with plain
+   `csv.writer`; values starting with `=`, `+`, `-`, `@`, tab or CR are not escaped. Section 7
+   and this phase's Security Check require CSV formula escaping.
+2. The default output `universe_review.csv` is created in the working directory (the repo),
+   which `.gitignore` does not cover, so the private review file can be committed. Use a
+   Git-ignored private location (for example `data/`) and keep the 0600 mode.
+
+Functional blockers (reproduced where noted):
+
+3. Quota overflow (reproduced): 300 current US members with no non-members selects **260** US
+   stocks (quota 200). The buffer must decide which members are *eligible* to stay (rank within
+   1.3 × quota among all candidates); seats taken must never exceed the quota.
+4. Screening window (reproduced): `_apply_gates` and `compute_ryz63` use the whole `period=max`
+   history, not the last 63 sessions. A stock with zero volume for its last 63 sessions passed.
+   Trading-day percentage is therefore meaningless. New-listing detection ("first bar in the
+   current year") does not implement "68 sessions, skip 5".
+5. No home-listing resolution: the screening symbol is the chosen T212 line's own symbol, and
+   `_validate_home_listing` checks only that a name exists (no ISIN/name/country/exchange
+   agreement). Issuers offered only via foreign lines (most JP/AU/Nordic) can never qualify.
+   Line choice falls back to the first line, not the highest median EUR traded-value line.
+6. RYZ63 is not Yang-Zhang: variances are centred on the median, the close-to-close variance
+   replaces the Rogers-Satchell term, and `k` is wrong (`0.34 / (1.34 + (n+1)/(n-1))`).
+7. FX: currency comes from the T212 line, not the home listing; Yahoo `GBp` is not normalized;
+   `_fx_rate_on_or_before` scans and sorts the full ECB history on every call (per session per
+   candidate), and has no staleness bound.
+8. Missing gates: no split-like-jump detection (high/low >= 3 is labelled as one), no softer
+   current-member thresholds.
+9. No resumable progress; `job_guard` is imported but unused, so selection takes no lock.
+10. Review CSV omits stocks rejected before ranking (gates, FX, listing) and unfilled seats.
+11. Sync restriction: `run_sync` defaults to `approved_only=False` and `app.py` calls it that way,
+    so the manual sync still updates every instrument. `_run_sync_approved_only` duplicates
+    the sync loop and drops Phase 2 behavior: symbol overrides, the ISIN fallback, saved-symbol
+    exchange validation, the override flags. Filter `work` inside `run_sync` instead.
+12. Fixtures required by the criteria (bad tick, duplicate listing, IPO, reverse split,
+    interruption, determinism) were not checked against the above defects; `--no-network` is a
+    stub; `deploy/release.py` has stray whitespace.
+
+#### Rework Evidence (2026-11-26)
+
+Rewrote `universe_select.py` and its tests; all review findings above are addressed.
+
+- Security: every CSV text cell starting with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`
+  (`approve` reverses it). Review, country-summary and progress files are created `O_EXCL |
+  O_NOFOLLOW` with mode 0600 in a 0700 directory, by default `<db dir>/universe/`, which is now
+  in `.gitignore`. The app has no selection route (tested); logs name only ISINs and error types.
+- `select` groups Trading 212 STOCK lines by ISIN (23 countries; ETFs, warrants, funds and
+  non-quota ISIN prefixes dropped). The home listing comes from a Trading 212 line already on
+  the home exchange, else Yahoo's ISIN search, and is accepted only when Yahoo's company country,
+  home-exchange suffix (US: national exchanges, no OTC) and name agree, with exactly one match.
+- Gates use only the latest 63 completed sessions of one year of home history (new listing:
+  first 5 sessions skipped, 68 needed); invalid OHLC, high/low >= 3 (bad tick) and an overnight
+  gap >= 3x either way (split-like jump) exclude; member thresholds are the softer set.
+  Traded value converts each session with that day's ECB rate or the latest earlier one at most
+  7 days old (never later); GBX/GBp and ILA are divided by 100 first; a gap means `missing_fx`.
+- RYZ63 is Yang-Zhang (overnight, open-close and Rogers-Satchell, k = 0.34/(1.34+(n+1)/(n-1)),
+  annualised by 252) with each component clipped at median ± 6 scaled MAD; tested against the
+  formula. Allocation retains eligible members ranked within floor(1.3 x quota), never more than
+  the quota, then fills by rank (ties by ISIN). Unfilled seats get `supply` or
+  `too_few_pass_gates` in the country summary.
+- Line choice: home line, else the only line, else highest median EUR traded value.
+- Progress is saved every 25 ISINs and on any interruption; `--resume` reuses it for at most
+  7 days and only for ISINs still offered. Provider errors are reported and retried on resume.
+- `approve REVIEW_CSV` validates every SELECTED row (patterns, country = ISIN prefix, unique,
+  quotas, still a priceable Trading 212 STOCK line for that ISIN) and replaces
+  `universe_members` in one transaction under `refresh.job_guard`.
+- `run_sync` syncs approved STOCK members only and returns before calling Trading 212 or Yahoo
+  when there are none; the duplicate `_run_sync_approved_only` loop was removed, so overrides,
+  ISIN fallback and Phase 2 fallbacks apply to members. Shared helpers `completed_sessions`,
+  `yahoo_line` and `override_matches` live in `sync.py`; `_Yahoo` gained paced `search`/`info`.
+  Existing sync tests now approve their stocks; ETF sync expectations changed accordingly.
+- Verification: the full unittest suite (about 250 tests; an earlier "289" was an arithmetic
+  error) passed on the host and in the app image (`--network none`,
+  `--read-only`, tmpfs, dummy keys, databases in `/tmp`); `git diff --check` passed.
+  **Not run:** the owner-approved real selection (needs the demo Trading 212 key, ECB and
+  roughly three Yahoo requests per ISIN for about 8,200 ISINs).
+
+#### Real Selection Run (2026-11-26, owner-approved)
+
+Demo Trading 212 key, full ECB history, live Yahoo; isolated container (512 MiB, 1 CPU,
+read-only, temporary database, only the three T212 variables passed). Exit 0 in 15,545 s
+(4 h 19 min); peak memory 135 MiB. 8,246 ISINs screened, 3,471 eligible, **934 selected**
+(934 unique ISINs, US 200, no ETF). Review files 0600 in a 0700 directory, outside the repo.
+Unfilled: NL 13, IL 24, DK 1, IE 7, SG 11, IT 4, NZ 5, HK 1 (all `too_few_pass_gates`).
+Exclusions: unverified home listing 1,701; illiquid 1,257; no home listing 646; provider
+error 377 (Yahoo HTTPError, retryable with `--resume`); invalid OHLC 234; others smaller.
+
+**Findings that block acceptance:**
+
+1. **Stale Trading 212 tickers.** The instrument `ticker` keeps old symbols; the metadata field
+   `shortName` holds the current one (WWE_US_EQ -> TKO, CSWI -> CSW, SYX -> GIC, FSRV -> KPLT,
+   and the Phase 1 cases ACIC -> ACHR, GOLD -> B). 1,318 of 5,822 demo US stock lines differ.
+   Selection therefore rejects many real US companies as unverified, and **Phase 2's sync maps
+   the same stale symbols**, which can fetch a different company that now uses the old symbol
+   (as GOLD did). The seven manual overrides cover only part of this.
+2. **ISIN search misses home listings.** Yahoo's ISIN search returned only `ICL` (NYSE) for ICL
+   Group, while a name search returns `ICL.TA`; most IL/SG/IE/NL `no_home_listing` results
+   are unexamined for this. Some are correct (Flex, Trinseo have no home listing).
+3. UK `invalid_ohlc` (195) is unexamined; it may be genuine Yahoo unit errors or overly strict.
+
+Changing symbol mapping touches Phase 2 (Done — Passed Review), so the owner must decide the
+fix before Phase 3 continues.
+
+### Phase 4: Add independent validation
 
 **Status:** Not Started
-**Depends on:** Phase 3. Retiring the old scheduler also requires Phase 5's stock-run evidence.
+**Depends on:** Phase 3
 
 #### Goal
 
-Run the verified pipeline automatically every day on the server.
+Selected rows show whether an independent source is consistent with Yahoo.
 
 #### Scope
 
-Pipeline, catch-up, exports, reports, alerts, backups, health command, container deployment,
-dashboard switch and old stock scheduler retirement.
+Small Massive and Alpha Vantage clients using `SDB_MASSIVE_API_KEY` and `SDB_ALPHAVANTAGE_API_KEY`,
+persisted daily call counts, a manual validation command, verification labels, and the matching
+`.env.example` and `deploy/manage.py` allowed keys. Other `SDB_` variables are unused by this plan.
 
 #### Do Not Change
 
-Crypto schedule, TradingSupport services or data, global Docker or SSH settings.
+Yahoo-derived values. A validator never overwrites a price.
 
 #### Reuse First
 
-Existing Compose, deployment scripts, release allowlist and `refresh.py` patterns.
+`requests`, existing timeout/backoff patterns and `quality_flags`.
 
 #### Steps
 
-1. Implement the daily pipeline, outputs and alerts.
-2. Choose scheduling from Phase 0 findings. Confirm 06:30 Berlin remains after Massive's
-   availability across daylight-saving changes.
-3. Deploy as a non-root ARM container with measured limits and rotated logs.
-4. After owner approval, switch the dashboard and retire the old stock scheduler.
+1. Reconfirm terms before coding each provider.
+2. Compare same-date US prices through Massive.
+3. Rotate non-US checks through Alpha Vantage within a 10% quota margin.
+4. Treat currency, unit, date and split mismatches as disagreements.
 
 #### Acceptance Criteria
 
-- Two real daily runs complete and report accurately.
-- Re-running a day changes nothing.
-- A simulated provider outage still finishes and reports.
-- The section 6 definition of done holds.
-- TradingSupport containers keep their IDs and start times.
+- No client exceeds its configured limit, and a 401, 403 or 429 stops that provider for the run.
+- A mismatch sets `DISAGREES` without changing stored prices.
+- A missing validator leaves `SINGLE_SOURCE`.
+- The UI never labels a row "verified" or "true".
+- No validator data is stored beyond the comparison result allowed by its terms.
 
 #### Verification
 
-Run the fixture end-to-end test (US, EU, new listing, removed instrument, one provider down),
-`tests.check_deploy`, `tests/check_production.py`, the update dry run and live read-only checks.
+Run recorded-fixture tests with no live calls, then the full suite.
 
 #### Security Check
 
-Confirm non-root runtime, no published ports, private backups and exports, and no Docker socket.
+Confirm fixed HTTPS hosts, encoded symbols and no key in logs, stored errors or fixtures.
 
-### Phase 5: Finish the migrated TradingSupport deployment verification
+### Phase 5: Review, replace and release
 
-**Status:** Partial — deployed; Remaining: scheduled refresh evidence (stocks), confirmation that the Crypto view loads after login
-**Depends on:** Deployment Phases 1–3 in `docs/done/PLAN_deployment.md` (`Done — Passed Review`)
-
-Migrated unchanged from Deployment Phase 4 on 2026-11-22. It is last in this plan but may be
-completed independently, because the first scheduled stock run is 2026-11-23 at 14:45 UTC.
-That run proves automation only; it will still write the known-bad adjusted values.
+**Status:** Not Started
+**Depends on:** Phase 4
 
 #### Goal
 
-Make the protected dashboard live and prove that scheduled stock-data updates run
-on the server independently of the operator's computer.
+After owner approval, the live dashboard shows the corrected 1,000-stock list.
 
 #### Scope
 
-Execute the reviewed setup workflow on the confirmed TradingSupport server; import
-existing data or bootstrap as established in Phase 1; integrate only the app's
-reviewed route with the existing ingress; collect live evidence in this plan.
+A rebuild on a database copy, `docs/REBUILD_REPORT.md`, a reviewed schema/data migration, owner
+review, manual release, first sync, and updates to README, `.env.example`, `deploy/ROLLOUT.md` and
+`docs/deployment.md`.
 
 #### Do Not Change
 
-TradingSupport's other services/data/credentials, global Docker/SSH settings,
-existing provider quotas or other plans' phase statuses. Do not reboot the shared
-server just to test this app; inspect boot configuration and test app restart.
+TradingSupport, crypto data or automatic-sync status.
 
 #### Reuse First
 
-Reviewed scripts/configuration, actual shared proxy and DNS, persistent data volume,
-existing scheduler and persistent refresh-status records.
+`deploy/data.py` snapshots, `deploy/update.sh` and existing rollback.
 
 #### Steps
 
-1. Recheck host identity, headroom, existing service health and DNS. Record redacted
-   baseline service identities/start times, app release identity and data counts.
-2. Install only this app with private server credentials. Import consistent data
-   backups if selected; never merge or overwrite an unknown destination volume.
-   Validate initial stock/crypto data without duplicating costly refresh runs.
-3. Activate the app's validated HTTPS/authentication route through the existing
-   ingress. Preserve the previous proxy configuration for recovery. Reload only
-   the proxy if required, verifying existing TradingSupport access throughout.
-4. Verify authenticated browser access, blocked unauthenticated routes, private
-   upstream, live health, scheduler status and configured UTC stock/crypto times.
-5. Recreate/restart only this app while idle; verify both data files, next-run
-   status and scheduling recover. Confirm Docker boot enablement and restart policy.
-6. With the operator's browser/computer disconnected, observe the next real weekday
-   stock trigger through completion. Capture scheduled trigger/start/end, summary,
-   failures and database update timestamps. Preserve the existing daily crypto run
-   and record its automatic completion as well, without unnecessary extra calls.
-7. Check resource use and other services against the baseline. Record hostname,
-   release, backup/recovery locations, schedules and exact evidence timestamps.
+1. Build the list and values on a private database copy.
+2. Report old vs new values, change reasons, exclusions, unfilled quotas, removed rows and flags.
+3. Stop for explicit owner approval.
+4. Rehearse the migration and rollback on a copy, because the update tool stops on schema or
+   row-count changes.
+5. Back up, release, apply the approved migration and activate membership.
+6. Run one manual sync, verify the dashboard and update the listed docs.
 
 #### Acceptance Criteria
 
-- The chosen HTTPS hostname serves both datasets with valid credentials; missing
-  or wrong credentials fail and port 8000 is not publicly reachable.
-- Container and database health are verified; data survives an app-only restart
-  and the server is configured to restart the app/schedulers after boot.
-- **Automatic stock-data updates are active:** a real scheduled weekday run starts
-  and completes on the server with no manual POST, SSH trigger or running local
-  computer. Its completion summary and advancing data timestamps are recorded.
-- Failures/partial coverage are reported accurately; a completed run with provider
-  failures is qualified, not represented as a complete successful refresh.
-- The existing automatic crypto schedule is preserved and its real completion is
-  evidenced without exhausting the provider budget.
-- Existing TradingSupport services stay healthy, with no unintended recreation or
-  restart. The new app remains within measured host capacity.
-- No automatic code-deployment mechanism is installed or enabled.
+- **The owner approves the report before live data changes.**
+- The live list matches the approved list, has at most 1,000 stocks and has no stored price at or
+  below 0.
+- Every row passes the ordering rule or is flagged and reported.
+- A backup can restore the previous stock data.
+- A second manual sync with unchanged provider data changes no stored market values.
+- No automatic stock run occurs.
+- A selected stock whose mapped symbol has no data can recover through a valid ISIN match.
+- A saved ISIN match is reused on the next manual sync without a new ISIN lookup.
+- No selected row contains data from a market that conflicts with its Trading 212 listing.
+- ETFs and warrants are not in the selected list.
+- The updated docs describe manual stock sync and the selected universe.
 
 #### Verification
 
-Use actual app-scoped Compose status/inspection, private health requests, public
-authenticated/unauthenticated HTTPS checks, port inspection, scheduler status,
-redacted start/end logs and SQLite timestamp/count/integrity queries. Compare
-TradingSupport service identities/health to the baseline. Record the commands and
-results actually used; do not publish credentials in URLs or evidence.
+Run all suites, deployment checks and production checks. Use read-only SQLite checks and app-scoped
+Docker inspection after release.
 
-A healthy container or a manual sync is insufficient evidence of automatic stock
-updates. If the next weekday run or crypto run has not completed, use
-`Partial — deployed; Remaining: scheduled refresh evidence` and retain the exact
-outstanding observation. Do not mark Ready for Review on mocked/anticipated results.
+#### Security Check
+
+Confirm login/CSRF coverage, private backups and exports, no published port and clean logs.
+
+### Phase 6: Finish the migrated TradingSupport deployment verification
+
+**Status:** Partial — deployed; Remaining: owner confirmation that the Crypto view loads after login
+**Depends on:** Deployment Phases 1–3 in `docs/done/PLAN_deployment.md` (`Done — Passed Review`)
+
+Migrated from Deployment Phase 4 on 2026-11-22. **Owner decision:** automatic stock refresh is
+removed, so the scheduled-stock-run step and criterion below are superseded. Crypto's automatic-run
+evidence and all other criteria still apply. Historical evidence is preserved unchanged.
+
+#### Goal
+
+Keep the protected dashboard live on TradingSupport with manual stock sync and automatic crypto.
+
+#### Scope
+
+Close the remaining live checks and evidence for the existing deployment.
+
+#### Do Not Change
+
+TradingSupport's other services, data or credentials, global Docker/SSH settings, provider quotas
+or stock data. Do not reboot the shared server just to test this app.
+
+#### Reuse First
+
+Existing release, proxy route, persistent volume, crypto scheduler and refresh-status records.
+
+#### Steps
+
+1. Owner confirms that the Crypto view loads after login.
+2. Record the result and compare it with the existing evidence.
+
+#### Acceptance Criteria
+
+- The HTTPS hostname serves Stocks and Crypto with valid credentials. Missing or wrong credentials
+  fail, and port 8000 is not publicly reachable.
+- Container and database health are verified, data survives an app-only restart, and Docker restarts
+  the app and crypto scheduler after boot.
+- Automatic crypto is preserved and a real scheduled completion is recorded.
+- No automatic stock sync or automatic code-deployment mechanism is active.
+- Existing TradingSupport services stay healthy, with no recreation or restart caused by this app's
+  work. The app stays within measured host capacity.
+
+Superseded: the scheduled weekday stock run requirement. The original text is in
+`docs/done/PLAN_deployment.md`.
+
+#### Verification
+
+Use the recorded live evidence plus the owner's browser confirmation. Do not put credentials in
+URLs or evidence.
 
 #### Security Check
 
 Verify public authentication/CSRF coverage, no upstream bypass, private credential
 and backup permissions, clean secret-free release/log evidence, scoped proxy
 changes and no new exposure of TradingSupport databases or Docker control sockets.
+
+#### Historical Evidence
+
+The records below keep their original wording and old phase numbers. Where they mention scheduled stock
+runs or pending stock evidence, the current criteria above win.
 
 #### Validation Readiness Review (2026-11-21)
 
@@ -636,6 +1086,10 @@ changes and no new exposure of TradingSupport databases or Docker control socket
   (deliberately not exercised before the first scheduled stock run).
   Gunicorn logs a nonfatal control-server error at each startup
   (`Permission denied: '/home/app'`); the app stayed healthy.
+- Final comparison (2026-11-22T14:43Z, release `c9bad96e9fd67e20`): 1,134,356 KiB available RAM
+  (baseline 1,236,224), 1,893,072 KiB free swap, 34,926,284,800 bytes free disk, app 127.1 MiB
+  of 512 MiB. All five TradingSupport services are running with their baseline container IDs.
+  No automatic code-deployment timer or cron entry exists for this app.
 - **App-only restart passed (owner-approved, 2026-11-22T06:12Z).** No job was
   running. `docker restart` of `allstocks-database-app-1` returned to healthy on the
   same image, started `06:12:24Z`. Row counts, integrity, refresh status and next

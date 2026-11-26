@@ -11,9 +11,10 @@ import tarfile
 
 
 FILES = (
-    "app.py", "sync.py", "crypto_sync.py", "refresh.py", "requirements.txt", "Dockerfile", ".dockerignore",
+    "app.py", "sync.py", "crypto_sync.py", "refresh.py", "universe_select.py", "requirements.txt", "Dockerfile", ".dockerignore",
     "compose.yaml", "compose.production.yaml", ".env.example", "README.md", "templates/index.html",
     "tests/__init__.py", "tests/test_app.py", "tests/test_sync.py", "tests/test_crypto_sync.py", "tests/test_refresh.py",
+    "tests/test_universe_select.py",
     "tests/check_production.py", "tests/check_deploy.py", "deploy/setup.sh", "deploy/update.sh",
     "deploy/manage.py", "deploy/release.py", "deploy/data.py", "deploy/server.env.example", "deploy/Caddyfile.stocks",
     "deploy/ROLLOUT.md", "docs/deployment.md", "docs/done/PLAN_deployment.md",
