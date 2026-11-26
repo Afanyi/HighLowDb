@@ -190,8 +190,14 @@ def status(db_path, mode, now=None):
     with _lock(db_path, "gate.lock", fcntl.LOCK_SH) as admitted:
         row["paused"] = not admitted
     eligible = _eligible_at(mode, due, now)
+    if mode == "stocks":
+        # Stock staleness is 7 days since the last successful manual sync,
+        # not the weekday schedule.
+        stale = not row["last_success_at"] or datetime.fromisoformat(row["last_success_at"]) < now - timedelta(days=7)
+    else:
+        stale = not row["last_success_at"] or datetime.fromisoformat(row["last_success_at"]) < previous
     row.update(next_run=eligible.isoformat(), overdue=due <= now,
-               stale=not row["last_success_at"] or datetime.fromisoformat(row["last_success_at"]) < previous,
+               stale=stale,
                schedule=f"{'Weekdays' if weekdays else 'Daily'} at {hh:02}:{mm:02} UTC")
     return row
 

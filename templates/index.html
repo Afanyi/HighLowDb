@@ -42,7 +42,7 @@
       {% if mode == "crypto" %}
         <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.coins }} coins, Backfilled: {{ summary.backfilled }}, Failed: {{ summary.failed }}</span>
       {% else %}
-        <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, No data: {{ summary.no_data }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
+        <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.ok }}, No data: {{ summary.no_data }}, Invalid: {{ summary.invalid or 0 }}, Failed: {{ summary.failed }}, Unmapped: {{ summary.unmapped }}</span>
       {% endif %}
     {% endif %}
     <form method="post" action="{{ url_for('sync_now' if mode == 'stocks' else 'sync_crypto_now') }}" class="d-inline">
@@ -185,7 +185,7 @@
               <option value="ETF" {% if instrument_type == "ETF" %}selected{% endif %}>ETF</option>
             </select>
           </th>
-          <th colspan="5"></th>
+          <th colspan="6"></th>
           {% else %}
           <th colspan="6"></th>
           {% endif %}
@@ -195,6 +195,8 @@
               <option value="ACTIVE" {% if status == "ACTIVE" %}selected{% endif %}>Active</option>
               {% if mode != "crypto" %}<option value="{{ new_tag }}" {% if status == new_tag %}selected{% endif %}>New this year</option>{% endif %}
               <option value="DELISTED_OR_ZERO" {% if status == "DELISTED_OR_ZERO" %}selected{% endif %}>Delisted/Zero</option>
+              {% if mode != "crypto" %}<option value="STALE" {% if status == "STALE" %}selected{% endif %}>Stale</option>
+              <option value="INVALID_VALUES" {% if status == "INVALID_VALUES" %}selected{% endif %}>Invalid values</option>{% endif %}
             </select>
           </th>
           <th>
@@ -233,8 +235,9 @@
 {% else %}
   <td>{{ row["ticker"] }}</td><td>{{ row["name"] or "—" }}</td><td>{{ row["exchange"] or "—" }}</td><td>{{ row["instrument_type"] or "—" }}</td>
 {% endif %}
-{%- for key in ("opening_price", "year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key], crypto=(mode == "crypto")) }}</td>{% endfor -%}
-<td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>
+{%- if mode == "crypto" %}<td class="text-end">{{ fmt(row["opening_price"], crypto=True) }}</td>{% else %}<td class="text-end">{{ fmt(row["current_price"]) }}</td><td>{{ row["price_date"] or "—" }}</td>{% endif -%}
+{%- for key in ("year_max", "year_min", "all_time_max", "all_time_min") %}<td class="text-end">{{ fmt(row[key], crypto=(mode == "crypto")) }}</td>{% endfor -%}
+<td><span class="badge text-bg-{% if st == "ACTIVE" %}success{% elif st.startswith("NEW_") %}info{% elif st in ("STALE", "INVALID_VALUES") %}warning{% else %}secondary{% endif %}">{{ st }}</span></td><td>{{ row["last_updated"] or "—" }}</td>
 {%- for key in distance_labels %}<td class="text-end">{{ fmt(row[key], pct=True) }}</td>{% endfor %}</tr>
       {% endfor %}
       {% endfor %}

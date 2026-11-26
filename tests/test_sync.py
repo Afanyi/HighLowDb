@@ -81,7 +81,8 @@ class TestComputeMetrics(unittest.TestCase):
         self.assertEqual(m["year_min"], 90.0)
         self.assertEqual(m["all_time_max"], 110.0)
         self.assertEqual(m["all_time_min"], 90.0)
-        self.assertEqual(m["opening_price"], 100.0)
+        self.assertEqual(m["current_price"], 105.0)
+        self.assertEqual(m["price_date"], "2025-01-08")
 
     def test_first_bar_current_year_new_tag(self):
         dates = pd.date_range("2026-01-02", periods=5, freq="D")
@@ -106,7 +107,9 @@ class TestComputeMetrics(unittest.TestCase):
             dates=dates,
         )
         m = sync.compute_metrics(hist, 2025)
-        self.assertEqual(m["status_tag"], "DELISTED_OR_ZERO")
+        # Close=0.005 is below Low=90, an impossible bar; rejected. Last valid close is 105.0.
+        self.assertEqual(m["status_tag"], "NEW_2025")
+        self.assertEqual(m["current_price"], 105.0)
 
     def test_three_bars_delisted(self):
         dates = pd.date_range("2025-01-02", periods=3, freq="D")
@@ -257,15 +260,15 @@ class TestRunSync(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         try:
             return {r[0]: r[1:] for r in conn.execute(
-                "SELECT ticker, name, exchange, opening_price, status_tag FROM stocks")}
+                "SELECT ticker, name, exchange, current_price, status_tag FROM stocks")}
         finally:
             conn.close()
 
     def _ok(self, last_open=100.0):
         return {
             "AAPL": [_hist([100.0] * 9 + [last_open], self.DATES)],
-            # A trailing all-NaN row is dropped, so the last real open is used.
-            "BP.L": [_hist([5.0] * 9 + [float("nan")], self.DATES)],
+            # A trailing all-NaN row is dropped, so the last real close is used.
+            "BP.L": [_hist([20.0] * 9 + [float("nan")], self.DATES)],
             "SPY": [_hist([400.0] * 10, self.DATES)],
             "NOPE": [YFPricesMissingError("NOPE", "")],
         }
@@ -276,15 +279,15 @@ class TestRunSync(unittest.TestCase):
             (summary["ok"], summary["no_data"], summary["failed"], summary["unmapped"]), (3, 1, 0, 1))
         rows = self._rows()
         self.assertEqual(set(rows), {"AAPL_US_EQ", "BPl_EQ", "SPY_US_EQ"})
-        self.assertEqual(rows["AAPL_US_EQ"], ("Apple Inc.", "US", 100.0, "ACTIVE"))
-        self.assertEqual(rows["BPl_EQ"], ("BP plc", "LSE", 5.0, "ACTIVE"))
+        self.assertEqual(rows["AAPL_US_EQ"], ("Apple Inc.", "US", 105.0, "ACTIVE"))
+        self.assertEqual(rows["BPl_EQ"], ("BP plc", "LSE", 25.0, "ACTIVE"))
 
     def test_rerun_updates_instead_of_duplicating(self):
         self._run(self._ok(100.0))
         self._run(self._ok(150.0))
         rows = self._rows()
         self.assertEqual(len(rows), 3)
-        self.assertEqual(rows["AAPL_US_EQ"][2], 150.0)
+        self.assertEqual(rows["AAPL_US_EQ"][2], 155.0)
 
     def test_rate_limit_waits_and_retries_without_failing(self):
         responses = self._ok()
@@ -424,7 +427,7 @@ class TestIsinFallback(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         try:
             return {r[0]: r[1:] for r in conn.execute(
-                "SELECT ticker, name, exchange, opening_price, status_tag, instrument_type FROM stocks")}
+                "SELECT ticker, name, exchange, current_price, status_tag, instrument_type FROM stocks")}
         finally:
             conn.close()
 
@@ -564,11 +567,11 @@ class TestIsinFallback(unittest.TestCase):
         real_upsert = sync._upsert
         calls = []
 
-        def flaky_upsert(*args):
+        def flaky_upsert(*args, **kwargs):
             calls.append(1)
             if len(calls) == 1:
                 raise sqlite3.OperationalError("database is locked")
-            return real_upsert(*args)
+            return real_upsert(*args, **kwargs)
 
         with patch("sync._upsert", side_effect=flaky_upsert):
             summary = self._run(
@@ -593,6 +596,448 @@ class TestIsinFallback(unittest.TestCase):
         self.assertEqual(summary["resolved_by_isin"], 0)
         self.assertEqual(summary["unmapped"], 1)
         self.assertEqual(summary["ok"], 0)
+
+
+class TestPhase2Regression(unittest.TestCase):
+    """Regression tests for Phase 2: correct five stored values."""
+
+    DATES = pd.date_range("2024-01-02", periods=10, freq="D")
+
+    def _hist(self, opens, highs, lows, closes, dates=None):
+        dates = dates if dates is not None else self.DATES
+        return pd.DataFrame(
+            {"Open": opens, "High": highs, "Low": lows, "Close": closes},
+            index=pd.DatetimeIndex(dates),
+        )
+
+    def test_dividend_adjusted_negative_low_rejected(self):
+        """Dividend-adjusted data with a negative low must not produce a non-traded low."""
+        hist = self._hist(
+            opens=[100.0] * 10,
+            highs=[110.0] * 10,
+            lows=[-2.8e6] * 10,  # dividend-adjusted garbage like XEB.F
+            closes=[105.0] * 10,
+        )
+        m = sync.compute_metrics(hist, 2025)
+        self.assertIsNone(m["all_time_min"])
+        self.assertEqual(m["status_tag"], "DELISTED_OR_ZERO")
+
+    def test_symbol_overrides_map_confirmed_corrections(self):
+        """Every Phase 1 confirmed override maps to the corrected Yahoo symbol."""
+        # Tickers and names as Trading 212 lists them (2026-11-22 export).
+        expected = {
+            "ACIC_US_EQ": ("ACHR", "US", "Archer Aviation", None),
+            "GOLD_US_EQ": ("B", "US", "Barrick Mining", None),
+            "CNX_US_EQ": ("CNR", "US", "Core Natural Resources", None),
+            "CR_US_EQ": ("CXT", "US", "Crane NXT", None),
+            "ALAIRp_EQ": ("ALMEX.PA", "PARIS", "Mexedia", None),
+            "SEV_US_EQ": ("SSM", "US", "Sono Group", None),
+            "UA_US_EQ": ("UAA", "US", "Under Armour (Class A)", "US9043111072"),
+        }
+        self.assertEqual(sync.SYMBOL_OVERRIDES, expected)
+
+    def test_ordering_rule_rejects_invalid_metrics(self):
+        """Metrics violating 0 < all_time_min <= year_min <= current_price <= year_max <= all_time_max are rejected."""
+        bad = {
+            "current_price": 100.0,
+            "price_date": "2026-01-08",
+            "year_max": 50.0,   # year_max < current_price: impossible
+            "year_min": 10.0,
+            "all_time_max": 200.0,
+            "all_time_min": 5.0,
+        }
+        self.assertFalse(sync._ordering_ok(bad))
+
+        good = {
+            "current_price": 100.0,
+            "price_date": "2026-01-08",
+            "year_max": 150.0,
+            "year_min": 50.0,
+            "all_time_max": 200.0,
+            "all_time_min": 10.0,
+        }
+        self.assertTrue(sync._ordering_ok(good))
+
+    def test_impossible_bar_rejected(self):
+        """A bar where close is outside [low, high] is rejected as impossible."""
+        hist = self._hist(
+            opens=[100.0] * 5,
+            highs=[110.0] * 5,
+            lows=[90.0] * 5,
+            closes=[120.0] * 5,  # close > high: impossible
+            dates=pd.date_range("2025-01-02", periods=5, freq="D"),
+        )
+        m = sync.compute_metrics(hist, 2025)
+        self.assertEqual(m["status_tag"], "DELISTED_OR_ZERO")
+        self.assertIsNone(m["current_price"])
+
+    def test_event_only_rows_discarded(self):
+        """Rows with all-NaN OHLC are discarded before computing metrics."""
+        dates = pd.date_range("2025-01-02", periods=11, freq="D")
+        opens = [100.0] * 10 + [float("nan")]
+        highs = [110.0] * 10 + [float("nan")]
+        lows = [90.0] * 10 + [float("nan")]
+        closes = [105.0] * 10 + [float("nan")]
+        hist = self._hist(opens, highs, lows, closes, dates)
+        m = sync.compute_metrics(hist, 2025)
+        self.assertEqual(m["current_price"], 105.0)
+        self.assertEqual(m["status_tag"], "NEW_2025")
+
+    def test_open_session_dated_next_local_day_excluded(self):
+        """At 23:30 UTC Sydney is already trading on the next local day; that bar is dropped."""
+        idx = pd.date_range("2026-11-20", periods=6, freq="D", tz="Australia/Sydney")
+        hist = pd.DataFrame({"Open": [10.0] * 6, "High": [11.0] * 6, "Low": [9.0] * 6,
+                             "Close": [10.0] * 5 + [10.5]}, index=idx)
+        now = pd.Timestamp("2026-11-24 23:30", tz="UTC")
+        with patch("sync.datetime") as dt:
+            dt.now.side_effect = lambda tz=None: now.tz_convert(tz).to_pydatetime()
+            m = sync.compute_metrics(hist, 2026)
+        self.assertEqual(m["price_date"], "2026-11-24")
+        self.assertEqual(m["current_price"], 10.0)
+
+    def test_completed_session_kept_after_close(self):
+        """A bar dated before today in exchange time is complete and kept."""
+        idx = pd.date_range("2026-11-20", periods=5, freq="D", tz="America/New_York")
+        hist = pd.DataFrame({"Open": [10.0] * 5, "High": [11.0] * 5, "Low": [9.0] * 5,
+                             "Close": [10.0] * 4 + [10.5]}, index=idx)
+        now = pd.Timestamp("2026-11-25 06:00", tz="UTC")  # 01:00 on 25 Nov in New York
+        with patch("sync.datetime") as dt:
+            dt.now.side_effect = lambda tz=None: now.tz_convert(tz).to_pydatetime()
+            m = sync.compute_metrics(hist, 2026)
+        self.assertEqual(m["price_date"], "2026-11-24")
+        self.assertEqual(m["current_price"], 10.5)
+
+    def test_float64_values_preserved(self):
+        """Values remain Python floats (float64), not float32 artifacts."""
+        hist = self._hist(
+            opens=[100.123456789] * 10,
+            highs=[110.123456789] * 10,
+            lows=[90.123456789] * 10,
+            closes=[105.123456789] * 10,
+        )
+        m = sync.compute_metrics(hist, 2025)
+        self.assertIsInstance(m["current_price"], float)
+        self.assertAlmostEqual(m["current_price"], 105.123456789, places=6)
+
+
+def _fake_ticker(split_only: pd.DataFrame, dividend_adjusted: pd.DataFrame, calls: list):
+    """yf.Ticker stand-in: default auto_adjust returns dividend-adjusted OHLC, as yfinance does."""
+    def make(symbol):
+        t = MagicMock()
+
+        def history(**kwargs):
+            calls.append((symbol, kwargs))
+            return split_only if kwargs.get("auto_adjust") is False else dividend_adjusted
+        t.history.side_effect = history
+        return t
+    return make
+
+
+class TestProviderRegressions(unittest.TestCase):
+    """XEB.F, TBT.F, ROST and LOBO cases from the Phase 1 audit, run through run_sync."""
+
+    DATES = pd.date_range("2024-01-02", periods=10, freq="D")
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+        patch("sync.time.sleep").start()
+        self.addCleanup(patch.stopall)
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def _frame(self, lows, highs, closes, adj=None):
+        df = pd.DataFrame({"Open": closes, "High": highs, "Low": lows, "Close": closes},
+                          index=self.DATES)
+        if adj is not None:
+            df["Adj Close"] = adj
+        return df
+
+    def _sync(self, ticker, name, split_only, dividend_adjusted):
+        calls = []
+        inst = [{"ticker": ticker, "type": "STOCK", "name": name, "isin": "DE0000000001"}]
+        with patch("sync.fetch_instruments", return_value=inst), \
+                patch("sync.yf.Ticker", side_effect=_fake_ticker(split_only, dividend_adjusted, calls)):
+            sync.run_sync(db_path=self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT all_time_min, all_time_max, current_price, country "
+                               "FROM stocks WHERE ticker=?", (ticker,)).fetchone()
+        finally:
+            conn.close()
+        self.assertTrue(calls)
+        for _sym, kwargs in calls:
+            self.assertIs(kwargs.get("auto_adjust"), False)
+        return row
+
+    def test_xeb_f_negative_dividend_adjusted_low_ignored(self):
+        split = self._frame([4.63] + [5.0] * 9, [6.0] * 10, [5.5] * 10,
+                            adj=[-2816771.75] + [5.0] * 9)
+        adjusted = self._frame([-2816771.75] + [5.0] * 9, [6.0] * 10, [5.5] * 10)
+        at_min, at_max, cur, country = self._sync("XEBd_EQ", "XEB", split, adjusted)
+        self.assertEqual(at_min, 4.63)
+        self.assertEqual(cur, 5.5)
+        self.assertEqual(country, "DE")
+
+    def test_tbt_f_reverse_split_history_used_as_is(self):
+        # Provider history is already split-adjusted; the factor must not be applied again.
+        split = self._frame([120.0] * 5 + [30.0] * 5, [130.0] * 5 + [33.0] * 5, [125.0] * 5 + [31.0] * 5)
+        adjusted = self._frame([90.0] * 5 + [29.0] * 5, [100.0] * 5 + [32.0] * 5, [95.0] * 5 + [30.0] * 5)
+        at_min, at_max, cur, _ = self._sync("TBTd_EQ", "TBT", split, adjusted)
+        self.assertEqual((at_min, at_max, cur), (30.0, 130.0, 31.0))
+
+    def test_rost_split_only_low_not_dividend_adjusted(self):
+        split = self._frame([0.1133] + [100.0] * 9, [150.0] * 10, [140.0] * 10)
+        adjusted = self._frame([0.0833] + [95.0] * 9, [145.0] * 10, [140.0] * 10)
+        at_min, _max, _cur, _ = self._sync("ROST_US_EQ", "Ross Stores", split, adjusted)
+        self.assertEqual(at_min, 0.1133)
+
+    def test_lobo_reverse_split_max_not_ten_times_low(self):
+        split = self._frame([10.0] * 10, [57.900001525878906] + [14.8] * 9, [12.0] * 10)
+        adjusted = self._frame([1.0] * 10, [5.79] + [1.48] * 9, [1.2] * 10)
+        at_min, at_max, cur, _ = self._sync("LOBO_US_EQ", "LOBO EV", split, adjusted)
+        self.assertEqual(at_max, 57.900001525878906)  # float64 kept as returned
+        self.assertEqual(cur, 12.0)
+
+
+class TestSymbolOverridesInSync(unittest.TestCase):
+    DATES = pd.date_range("2024-01-02", periods=10, freq="D")
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+        patch("sync.time.sleep").start()
+        self.addCleanup(patch.stopall)
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def _run(self, instruments):
+        hist = pd.DataFrame({"Open": [10.0] * 10, "High": [11.0] * 10, "Low": [9.0] * 10,
+                             "Close": [10.0] * 10}, index=self.DATES)
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker, \
+                patch("sync.get_ticker_by_isin", return_value=None):
+            mock_ticker.return_value.history.return_value = hist
+            sync.run_sync(db_path=self.db_path)
+            symbols = [c.args[0] for c in mock_ticker.call_args_list]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = {r[0]: r[1:] for r in conn.execute(
+                "SELECT ticker, current_price, quality_flags, status_tag FROM stocks")}
+        finally:
+            conn.close()
+        return symbols, rows
+
+    def test_matching_overrides_fetch_corrected_symbols(self):
+        symbols, rows = self._run([
+            {"ticker": "ALAIRp_EQ", "type": "STOCK", "name": "Mexedia", "isin": "FR0000000001"},
+            {"ticker": "UA_US_EQ", "type": "STOCK", "name": "Under Armour (Class A)", "isin": "US9043111072"},
+        ])
+        self.assertEqual(sorted(symbols), ["ALMEX.PA", "UAA"])
+        self.assertEqual(rows["UA_US_EQ"][1], "OVERRIDE")
+
+    def test_mismatched_override_never_uses_old_symbol(self):
+        # Class C ISIN on the Class A ticker: neither UA nor UAA may be fetched.
+        symbols, rows = self._run([
+            {"ticker": "UA_US_EQ", "type": "STOCK", "name": "Under Armour (Class A)", "isin": "US9043112062"},
+        ])
+        self.assertEqual(symbols, [])
+        self.assertNotIn("UA_US_EQ", rows)
+
+    def test_mismatched_override_flags_existing_row(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO stocks (ticker, name, current_price, price_date, year_max, year_min, "
+                     "all_time_max, all_time_min) VALUES ('GOLD_US_EQ', 'Barrick Mining', "
+                     "50, '2026-01-02', 60, 40, 70, 1)")
+        conn.commit()
+        conn.close()
+        symbols, rows = self._run([
+            {"ticker": "GOLD_US_EQ", "type": "STOCK", "name": "Gold.com", "isin": "US0000000001"},
+        ])
+        self.assertEqual(symbols, [])
+        self.assertEqual(rows["GOLD_US_EQ"], (50.0, "OVERRIDE_MISMATCH:NO_DATA", "STALE"))
+
+
+class TestLastGoodValueRetention(unittest.TestCase):
+    """Test that failed/empty Yahoo responses leave previous valid values unchanged."""
+
+    DATES = pd.date_range("2024-01-02", periods=10, freq="D")
+
+    def _hist(self, closes):
+        return pd.DataFrame(
+            {"Open": closes, "High": [c + 10 for c in closes], "Low": [c - 10 for c in closes],
+             "Close": closes},
+            index=self.DATES,
+        )
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+        self.sleep = patch("sync.time.sleep").start()
+        self.addCleanup(patch.stopall)
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def _rows(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return {r[0]: r[1:] for r in conn.execute(
+                "SELECT ticker, current_price, price_date, status_tag FROM stocks")}
+        finally:
+            conn.close()
+
+    def test_no_data_keeps_previous_valid_values(self):
+        """A Yahoo no_data response keeps existing validated values and flags STALE."""
+        instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
+        # First run: store valid values (Close=100.0).
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker:
+            t = MagicMock()
+            t.history.return_value = self._hist([100.0] * 10)
+            mock_ticker.return_value = t
+            sync.run_sync(db_path=self.db_path)
+        rows = self._rows()
+        self.assertEqual(rows["AAPL_US_EQ"][0], 100.0)
+        self.assertEqual(rows["AAPL_US_EQ"][2], "ACTIVE")
+
+        # Second run: Yahoo returns no data → keep previous values, flag STALE.
+        empty = pd.DataFrame(
+            {"Open": [], "High": [], "Low": [], "Close": []},
+            index=pd.DatetimeIndex([]),
+        )
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker:
+            t = MagicMock()
+            t.history.return_value = empty
+            mock_ticker.return_value = t
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(summary["no_data"], 1)
+        rows = self._rows()
+        self.assertEqual(rows["AAPL_US_EQ"][0], 100.0)  # unchanged
+        self.assertEqual(rows["AAPL_US_EQ"][2], "STALE")
+
+    def test_invalid_new_values_keep_previous_valid_values(self):
+        """New values failing the ordering rule keep existing validated values."""
+        instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
+        # First run: store valid values (Close=100.0).
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker:
+            t = MagicMock()
+            t.history.return_value = self._hist([100.0] * 10)
+            mock_ticker.return_value = t
+            sync.run_sync(db_path=self.db_path)
+        rows = self._rows()
+        self.assertEqual(rows["AAPL_US_EQ"][0], 100.0)
+
+        # Second run: compute_metrics returns invalid values → keep previous.
+        invalid_metrics = {
+            "current_price": 150.0, "price_date": "2026-01-08",
+            "year_max": 50.0,   # year_max < current_price: violates ordering
+            "year_min": 10.0,
+            "all_time_max": 200.0, "all_time_min": 5.0,
+            "status_tag": "ACTIVE",
+        }
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker, \
+                patch("sync.compute_metrics", return_value=invalid_metrics):
+            t = MagicMock()
+            t.history.return_value = self._hist([100.0] * 10)
+            mock_ticker.return_value = t
+            sync.run_sync(db_path=self.db_path)
+        rows = self._rows()
+        self.assertEqual(rows["AAPL_US_EQ"][0], 100.0)  # unchanged
+        self.assertEqual(rows["AAPL_US_EQ"][2], "INVALID_VALUES")
+
+    def _legacy_row(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        # Old calculation: opening_price only and a negative dividend-adjusted low.
+        conn.execute("INSERT INTO stocks (ticker, name, opening_price, year_max, year_min, "
+                     "all_time_max, all_time_min, status_tag) VALUES "
+                     "('AAPL_US_EQ', 'Apple', 100, 110, 90, 150, -5, 'ACTIVE')")
+        conn.commit()
+        conn.close()
+
+    def _legacy_values(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute("SELECT year_max, year_min, all_time_max, all_time_min, status_tag, "
+                                "quality_flags FROM stocks WHERE ticker='AAPL_US_EQ'").fetchone()
+        finally:
+            conn.close()
+
+    def test_no_data_clears_legacy_invalid_values(self):
+        self._legacy_row()
+        instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
+        empty = pd.DataFrame({"Open": [], "High": [], "Low": [], "Close": []}, index=pd.DatetimeIndex([]))
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker, \
+                patch("sync.get_ticker_by_isin", return_value=None):
+            mock_ticker.return_value.history.return_value = empty
+            sync.run_sync(db_path=self.db_path)
+        self.assertEqual(self._legacy_values(), (None, None, None, None, "STALE", "NO_DATA"))
+
+    def test_invalid_new_values_clear_legacy_invalid_values(self):
+        self._legacy_row()
+        instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
+        invalid = {"current_price": 150.0, "price_date": "2026-01-08", "year_max": 50.0,
+                   "year_min": 10.0, "all_time_max": 200.0, "all_time_min": 5.0, "status_tag": "ACTIVE"}
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker, \
+                patch("sync.compute_metrics", return_value=invalid):
+            mock_ticker.return_value.history.return_value = self._hist([100.0] * 10)
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual((summary["ok"], summary["invalid"]), (0, 1))
+        self.assertEqual(self._legacy_values(), (None, None, None, None, "INVALID_VALUES", "INVALID"))
+
+    def test_request_failing_every_pass_flags_row(self):
+        sync.init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.executemany(
+            "INSERT INTO stocks (ticker, name, current_price, price_date, year_max, year_min, "
+            "all_time_max, all_time_min, status_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+            [("AAPL_US_EQ", "Apple", 100.0, "2026-01-02", 110.0, 90.0, 150.0, 80.0),
+             ("MSFT_US_EQ", "Microsoft", 100.0, "2026-01-02", 110.0, 90.0, 150.0, -5.0)])
+        conn.commit()
+        conn.close()
+        instruments = [
+            {"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"},
+            {"ticker": "MSFT_US_EQ", "type": "STOCK", "name": "Microsoft", "isin": "US5949181045"},
+            {"ticker": "NVDA_US_EQ", "type": "STOCK", "name": "NVIDIA", "isin": "US67066G1040"},
+        ]
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.side_effect = ConnectionError("down")
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(summary["failed"], 3)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = {r[0]: r[1:] for r in conn.execute(
+                "SELECT ticker, current_price, all_time_min, status_tag, quality_flags FROM stocks")}
+        finally:
+            conn.close()
+        self.assertEqual(rows["AAPL_US_EQ"], (100.0, 80.0, "STALE", "FAILED"))  # kept, flagged
+        self.assertEqual(rows["MSFT_US_EQ"], (None, None, "STALE", "FAILED"))   # legacy cleared
+        self.assertNotIn("NVDA_US_EQ", rows)                                   # no new row
+
+    def test_invalid_values_without_row_create_nothing(self):
+        instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
+        invalid = {"current_price": 150.0, "price_date": "2026-01-08", "year_max": 50.0,
+                   "year_min": 10.0, "all_time_max": 200.0, "all_time_min": 5.0, "status_tag": "ACTIVE"}
+        with patch("sync.fetch_instruments", return_value=instruments), \
+                patch("sync.yf.Ticker") as mock_ticker, \
+                patch("sync.compute_metrics", return_value=invalid):
+            mock_ticker.return_value.history.return_value = self._hist([100.0] * 10)
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(summary["invalid"], 1)
+        self.assertEqual(self._rows(), {})
 
 
 if __name__ == "__main__":

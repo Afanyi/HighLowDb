@@ -456,7 +456,7 @@ private metadata/sample artifacts. No blocking findings or credible security iss
 
 ### Phase 2: Correct the five stored values
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 1
 
 #### Goal
@@ -507,6 +507,144 @@ databases and no network.
 #### Security Check
 
 Confirm parameterized SQL, safe symbol handling and no raw provider error text in stored status.
+
+#### Review Result (2026-11-26)
+
+**Review Failed.** No credible security issue found (SQL parameterized, symbols from a fixed
+table, no provider text stored). 197 unittests pass on the host; the required isolated,
+network-disabled container run was not performed. No execution evidence or status change
+was recorded before review.
+
+Blocking:
+
+1. `templates/index.html`: stock header is Price, Date, Year High…, but cells render the price
+   date after All-Time Low, so every stock column from Date onward is misaligned.
+2. `sync._sync_one`: when the stored row is legacy-invalid and the new fetch fails or is
+   invalid, nothing is written, so the legacy invalid values stay and the row is not flagged.
+   Fails "legacy invalid value is not retained" and "failed response flags the row".
+   Invalid new values with no stored row also return `"ok"`, inflating the summary.
+3. `SYMBOL_OVERRIDES`: name check is a substring test (comment claims token match). "Barrick
+   Gold" will not match the Trading 212 name "Barrick Mining", so that override silently falls
+   back to the wrong symbol. Under Armour is resolved by ticker, but Phase 1 found only the ISIN
+   distinguishes Class A (`US9043111072`) from Class C; key or validate it by ISIN.
+   A failed name check must flag the row rather than silently use the old mapping.
+4. Missing regression fixtures for XEB.F, TBT.F, ROST and LOBO (the negative-low test uses a
+   synthetic all-invalid frame) and no test that overrides are actually applied in `run_sync`.
+5. New status tags `STALE` and `INVALID_VALUES` are not accepted by `app.STATUS_PATTERN` and get
+   the grey badge; filtering by them is impossible.
+
+Optional: `country` is read from a nonexistent `inst["country"]` (plan: ISIN prefix);
+`numeric_cols` one-liner in `app.py` is hard to read; dropping any bar dated today in UTC
+also drops completed sessions in Asia/Europe after close (conservative, acceptable).
+
+#### Rework Evidence (2026-11-26)
+
+All five blocking review findings were addressed; ready for re-review, not passed.
+
+1. Template: stock rows render Price then Date, matching the header; a test checks cell order.
+2. `_sync_one` now has one fallback path. No data or invalid new values keep last good values,
+   or clear stored values that break the ordering rule (legacy values become missing), and
+   always flag the existing row (`STALE`/`NO_DATA` or `INVALID_VALUES`/`INVALID`). No row is
+   created without valid values. Invalid results count as `invalid` in the summary, shown on
+   the dashboard, not `ok`.
+3. Overrides use the exact Trading 212 names from the 2026-11-22 export ("Barrick Mining",
+   "Under Armour (Class A)"); Under Armour also requires ISIN `US9043111072`. The Mexedia key
+   was wrong (`ALAIR_PA_EQ`); Trading 212 uses `ALAIRp_EQ`. A mismatched override fetches no
+   prices, never falls back to the old symbol and flags an existing row `OVERRIDE_MISMATCH`.
+4. Added run_sync regression tests for XEB.F, TBT.F, ROST and LOBO through a fake provider that
+   returns dividend-adjusted OHLC unless `auto_adjust=False`. They assert every call disables
+   adjustment and the stored values are the split-only ones. Fixture values come from the audit;
+   they are synthetic frames, not recorded provider data. Added tests showing overrides are
+   applied, mismatches are refused, and legacy invalid rows are cleared.
+5. `STALE` and `INVALID_VALUES` are accepted by `STATUS_PATTERN`, selectable as stock filters
+   and shown with a warning badge.
+
+Also fixed the optional findings: `country` is the ISIN prefix, and `numeric_cols` is simplified.
+Verification: 209 unittests passed on the host and in the app image (`--network none`,
+`--read-only`, tmpfs, dummy keys, `DB_PATH`/`CRYPTO_DB_PATH` in `/tmp`; the default `/data`
+is not writable by the image user). `git diff --check` passed. Security: SQL stays
+parameterized, override symbols come from a fixed table, stored flags are fixed strings,
+logs name only the ticker, the container could not read env files, and no history is stored.
+
+#### Re-review Result (2026-11-26)
+
+**Review Failed.** All five earlier blocking findings are fixed and verified (cell order, legacy
+clearing and flagging, exact name/ISIN overrides including `ALAIRp_EQ`, provider regression
+tests, new status filters). 209 tests pass in the isolated image. No security issue found.
+Note: the same agent session implemented the rework, so this is not an independent review.
+
+Blocking:
+
+1. `sync.compute_metrics` compares the last bar's exchange-local date with today's **UTC** date.
+   Between about 22:00 and 24:00 UTC, Australian and New Zealand bars are already dated the next
+   local day, so a still-trading bar is kept. Reproduced: Sydney-indexed history with
+   `now = 2026-11-24 23:30 UTC` (10:30 local, market open) stored `price_date` 2026-11-25. Fails
+   step 2 ("exclude an unfinished current-day bar"). Fix: use today in the index's own time
+   zone (`datetime.now(last_idx.tz)` when tz-aware), and add a test for this case.
+
+Optional: `test_crypto_staleness_unchanged_by_stock_rule` checks only the schedule label, not the
+crypto `stale` value; stock status still reports a weekday `schedule`/`next_run` although stock
+sync is manual-only (Phase 0 area, not a Phase 2 criterion).
+
+#### Rework Evidence 2 (2026-11-26)
+
+Fixed the re-review blocker. `compute_metrics` now compares the last bar's date with today in
+that bar's own exchange time zone (UTC only for a tz-naive index), so an Australian or New
+Zealand session still trading after 22:00 UTC is dropped. Same-day bars are still dropped after
+the close by design (conservative). New tests: Sydney bar at 23:30 UTC is excluded; a New York
+bar dated the previous local day is kept. 211 unittests passed on the host and in the isolated
+image (`--network none`, `--read-only`, tmpfs, dummy keys, databases in `/tmp`);
+`git diff --check` passed. No new security-sensitive behavior.
+Optional re-review notes were not changed.
+
+#### Re-review Result 2 (2026-11-26)
+
+**Review Failed.** The time-zone blocker is fixed and tested (Sydney bar at 23:30 UTC excluded,
+previous-day New York bar kept); 211 tests pass in the isolated image; no security issue found.
+Same-session review, not independent.
+
+Blocking:
+
+1. Acceptance criterion "A failed or empty Yahoo response leaves previous valid values unchanged
+   and flags the row" is met only for empty/no-data responses. A request that raises on every
+   retry pass (for example `ConnectionError`) is listed in `failed_tickers`, but its row is not
+   flagged. Reproduced: an existing valid `BPl_EQ` row stayed `ACTIVE` with no `quality_flags`
+   after four failed passes. Legacy invalid values in such a row are also left in place, which
+   conflicts with "A legacy invalid value is not retained as good data". Fix: after the final
+   pass, apply the existing fallback (keep or clear and flag, e.g. `STALE` / `FAILED`) to each
+   still-failing ticker with a stored row, and add a test.
+
+#### Rework Evidence 3 (2026-11-26)
+
+- Tickers still failing after every retry pass now go through the same fallback as no-data
+  responses (`_keep_last_good`): good values kept, invalid or legacy values cleared, row flagged
+  `STALE` / `FAILED`, no new row created. The test covers a kept row, a cleared legacy row and an
+  instrument without a row.
+- Removed unreachable leftover code from the first rework at the end of the old `_sync_one`
+  (it referenced an undefined `existing`). The `run_sync` docstring now lists `invalid`.
+- 212 unittests passed on the host and in the isolated image (`--network none`, `--read-only`,
+  tmpfs, dummy keys, databases in `/tmp`); `git diff --check` passed.
+
+#### Final Review Result (2026-11-26)
+
+**Done — Passed Review.** Full Phase 2 diff re-read (`sync.py`, `app.py`, `refresh.py`,
+`templates/index.html`, tests). **Limitation:** the same agent session implemented and reviewed
+this phase; an independent review by the owner or a fresh session is recommended before Phase 5.
+
+| Acceptance criterion | Evidence | Result |
+|---|---|---|
+| Dividend-adjusted fixtures cannot produce negative or non-traded lows | Every Yahoo call sends `auto_adjust=False`; the fake provider returns adjusted OHLC otherwise; impossible bars are rejected | Passed |
+| XEB.F, TBT.F, ROST, LOBO and all Phase 1 overrides pass | Full run_sync tests on audit-based synthetic frames; 7 overrides with exact T212 names, Under Armour ISIN, mismatch refusal | Passed |
+| Failed or empty response keeps previous valid values and flags the row | No data → `STALE`/`NO_DATA`; failing every pass → `STALE`/`FAILED`; invalid → `INVALID_VALUES` | Passed |
+| Legacy invalid value not retained as good data | Values that break the ordering rule are cleared on every fallback path | Passed |
+| Stock staleness is 7 days; crypto unchanged | `refresh.status` tests; crypto keeps its schedule rule and `opening_price` | Passed |
+| Calendar year; float64 preserved | `index.year == year`; Python float test, LOBO 57.900001525878906 kept | Passed |
+| No price history written | Only `stocks` and `yahoo_symbols` tables; history discarded after `compute_metrics` | Passed |
+
+Security: parameterized SQL, override symbols from a fixed table, fixed-string flags, logs name
+only the ticker, no provider text stored; no issue found. Optional, not blocking: the crypto
+staleness test checks only the schedule label; the stock status still shows a weekday schedule
+(Phase 0 area); `current_year` uses server-local time.
 
 ### Phase 3: Select the 1,000-stock universe
 
