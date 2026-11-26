@@ -77,6 +77,8 @@ EXCHANGE_COUNTRIES = {
 
 # A Yahoo symbol accepted from an ISIN lookup: uppercase, dots/dashes/caret/equals allowed.
 ISIN_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.\-^=]{1,20}$")
+# Trading 212 keeps a US line's original ticker after a symbol change; shortName is current.
+US_SHORT_NAME = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z])?$")
 
 
 # Confirmed Yahoo symbol corrections from the Phase 1 audit.
@@ -145,6 +147,57 @@ def _ordering_ok(metrics: dict) -> bool:
     return True
 
 
+def override_matches(inst: dict) -> bool:
+    """True if the instrument has a symbol override and its exact name (and ISIN) match."""
+    if inst.get("ticker") not in SYMBOL_OVERRIDES:
+        return False
+    _sym, _exch, name, isin = SYMBOL_OVERRIDES[inst["ticker"]]
+    return (inst.get("name") or "").strip().casefold() == name.casefold() and (
+        isin is None or inst.get("isin") == isin)
+
+
+def line_symbol(inst: dict) -> tuple[str, str] | None:
+    """(Yahoo symbol, exchange) from a Trading 212 line; US lines use the current shortName
+    (BRK.B / TAP/A -> BRK-B / TAP-A) and fall back to the ticker when it is missing."""
+    mapped = to_yahoo(inst["ticker"])
+    if mapped and mapped[1] == "US":
+        short = (inst.get("shortName") or "").replace(".", "-").replace("/", "-")
+        if US_SHORT_NAME.match(short):
+            return short, "US"
+    return mapped
+
+
+def yahoo_line(inst: dict) -> tuple[str, str] | None:
+    """(Yahoo symbol, exchange) for a Trading 212 line, honouring confirmed overrides.
+
+    None when the line cannot be priced: unmapped, or an override whose identity check fails.
+    """
+    if inst.get("ticker") in SYMBOL_OVERRIDES:
+        if not override_matches(inst):
+            return None
+        sym, exch, _name, _isin = SYMBOL_OVERRIDES[inst["ticker"]]
+        return sym, exch
+    return line_symbol(inst)
+
+
+def _approved_tickers(conn) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT ticker FROM universe_members")}
+
+
+def completed_sessions(hist: pd.DataFrame) -> pd.DataFrame:
+    """Drop event-only rows (no OHLC) and an unfinished current-day bar.
+
+    The last bar is dropped when it is dated today in the exchange's own time zone,
+    because the market may still be open.
+    """
+    df = hist.dropna(subset=["Open", "High", "Low", "Close"], how="all")
+    if not df.empty:
+        last = pd.Timestamp(df.index[-1])
+        if last.date() == datetime.now(last.tz or timezone.utc).date():
+            df = df.iloc[:-1]
+    return df
+
+
 def init_db(db_path: str = DB_PATH) -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -191,6 +244,18 @@ def init_db(db_path: str = DB_PATH) -> None:
                 ticker TEXT PRIMARY KEY,
                 yahoo_symbol TEXT NOT NULL,
                 resolved_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS universe_members (
+                ticker TEXT PRIMARY KEY,
+                isin TEXT NOT NULL,
+                country TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                volatility REAL NOT NULL,
+                selected_at TEXT NOT NULL
             )
             """
         )
@@ -250,16 +315,10 @@ def compute_metrics(hist: pd.DataFrame, year: int) -> dict:
             "status_tag": "DELISTED_OR_ZERO",
         }
 
-    # Work on a copy so the caller's frame is not mutated.
-    df = hist.copy()
-
-    # Discard event-only rows: rows where all four OHLC values are NaN.
-    df = df.dropna(subset=["Open", "High", "Low", "Close"], how="all")
-
-    # Reject rows with any impossible bar (non-positive, high<low, open/close outside [low,high]).
-    valid_mask = df.apply(_valid_bar, axis=1)
-    df = df[valid_mask]
-
+    # Event-only rows and an unfinished current-day bar are not price observations;
+    # impossible bars (non-positive, high<low, open/close outside [low,high]) are rejected.
+    df = completed_sessions(hist)
+    df = df[df.apply(_valid_bar, axis=1)] if not df.empty else df
     if df.empty:
         return {
             "current_price": None,
@@ -270,22 +329,6 @@ def compute_metrics(hist: pd.DataFrame, year: int) -> dict:
             "all_time_min": None,
             "status_tag": "DELISTED_OR_ZERO",
         }
-
-    # Exclude an unfinished current-day bar: the last session if it is dated today in the
-    # exchange's own time zone (the market may still be open, so drop it).
-    last_idx = pd.Timestamp(df.index[-1])
-    if last_idx.date() == datetime.now(last_idx.tz or timezone.utc).date():
-        df = df.iloc[:-1]
-        if df.empty:
-            return {
-                "current_price": None,
-                "price_date": None,
-                "year_max": None,
-                "year_min": None,
-                "all_time_max": None,
-                "all_time_min": None,
-                "status_tag": "DELISTED_OR_ZERO",
-            }
 
     # All values as native Python floats (float64 preserved, no float32 artifacts).
     at_max = float(df["High"].max())
@@ -329,8 +372,8 @@ class _Yahoo:
         yf.config.debug.hide_exceptions = False
         self.backoff = RATE_LIMIT_BACKOFF
 
-    def history(self, yahoo: str) -> pd.DataFrame | None:
-        """Return the full history, or None if Yahoo has no data for the symbol.
+    def history(self, yahoo: str, period: str = "max") -> pd.DataFrame | None:
+        """Return the history for ``period``, or None if Yahoo has no data for the symbol.
 
         Raises the last error if the symbol still fails after MAX_ATTEMPTS.
         """
@@ -338,7 +381,7 @@ class _Yahoo:
         while True:
             time.sleep(REQUEST_DELAY)
             try:
-                hist = yf.Ticker(yahoo).history(period="max", actions=False, auto_adjust=False)
+                hist = yf.Ticker(yahoo).history(period=period, actions=False, auto_adjust=False)
             except YFRateLimitError:
                 log.warning("Yahoo rate limit hit; waiting %ds before retrying %s", self.backoff, yahoo)
                 time.sleep(self.backoff)
@@ -355,6 +398,36 @@ class _Yahoo:
             self.backoff = RATE_LIMIT_BACKOFF
             hist = hist.dropna(how="all")
             return None if hist.empty else hist
+
+    def _call(self, label: str, fn):
+        """Run one paced Yahoo request with the same back-off as history(); raise when it
+        still fails after MAX_ATTEMPTS."""
+        attempts = 0
+        while True:
+            time.sleep(REQUEST_DELAY)
+            try:
+                return fn()
+            except YFRateLimitError:
+                log.warning("Yahoo rate limit hit; waiting %ds before %s", self.backoff, label)
+                time.sleep(self.backoff)
+                self.backoff = min(self.backoff * 2, MAX_RATE_LIMIT_BACKOFF)
+            except YFTickerMissingError:
+                return None
+            except Exception as exc:
+                if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+                    return None  # Yahoo does not know the symbol: not a provider failure
+                attempts += 1
+                if attempts >= MAX_ATTEMPTS:
+                    raise
+                time.sleep(2 ** attempts)
+
+    def search(self, query: str) -> list[dict]:
+        """Yahoo quote search results (symbol, exchange, names) for an ISIN or name."""
+        return self._call("search", lambda: yf.Search(query, max_results=10, news_count=0).quotes) or []
+
+    def info(self, yahoo: str) -> dict:
+        """Yahoo company metadata (name, country, exchange, currency) for a symbol."""
+        return self._call("info " + yahoo, lambda: yf.Ticker(yahoo).info) or {}
 
     def isin_to_symbol(self, isin: str) -> str | None:
         """Resolve an ISIN to a Yahoo symbol, with the same pacing and back-off as history().
@@ -471,7 +544,10 @@ def _save_symbol(conn, ticker: str, symbol: str) -> None:
 def run_sync(db_path: str = DB_PATH) -> dict:
     """Fetch T212 instruments, map to Yahoo, download metrics, upsert into SQLite.
 
-    STOCK and ETF instruments are kept; warrants are skipped. A confirmed symbol override is used
+    Only approved members (the ``universe_members`` table) are synced. With no approved
+    members the sync returns at once, without calling Trading 212 or Yahoo.
+
+    A confirmed symbol override is used
     first; otherwise a saved ISIN match, the symbol from the T212 ticker, or for unmappable
     tickers an ISIN lookup. A symbol with no data is retried once through the ISIN. An ISIN match
     is saved only once Yahoo returned prices for it, and a saved match without data is dropped.
@@ -484,9 +560,21 @@ def run_sync(db_path: str = DB_PATH) -> dict:
     to try.
     """
     init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        members = _approved_tickers(conn)
+    finally:
+        conn.close()
+    if not members:
+        log.info("No approved universe members; not calling Yahoo")
+        now = datetime.now(timezone.utc).isoformat()
+        return {"ok": 0, "no_data": 0, "invalid": 0, "failed": 0, "unmapped": 0,
+                "resolved_by_isin": 0, "failed_tickers": [], "started_at": now, "finished_at": now}
+
     instruments = fetch_instruments()
 
-    keep = [i for i in instruments if i.get("type") in ("STOCK", "ETF")]
+    keep = [i for i in instruments if i.get("type") == "STOCK" and i["ticker"] in members]
+    missing_members = len(members) - len(keep)
 
     yahoo = _Yahoo()
     conn = sqlite3.connect(db_path)
@@ -507,16 +595,15 @@ def run_sync(db_path: str = DB_PATH) -> dict:
             ticker = inst["ticker"]
             # Confirmed symbol override takes precedence; name must match the instrument.
             if ticker in SYMBOL_OVERRIDES:
-                ov_sym, ov_exch, ov_name, ov_isin = SYMBOL_OVERRIDES[ticker]
-                if (inst.get("name") or "").strip().casefold() == ov_name.casefold() and (
-                        ov_isin is None or inst.get("isin") == ov_isin):
+                ov_sym, ov_exch, _name, _isin = SYMBOL_OVERRIDES[ticker]
+                if override_matches(inst):
                     work[ticker] = [inst, ov_sym, ov_exch, "override", None, "OVERRIDE"]
                 else:
                     # Never fall back to the known-wrong symbol.
                     log.warning("Symbol override for %s does not match the instrument; skipped", ticker)
                     work[ticker] = [inst, None, ov_exch, "override", None, "OVERRIDE_MISMATCH"]
                 continue
-            mapped = to_yahoo(ticker)
+            mapped = line_symbol(inst)
             expected = mapped[1] if mapped else None
             saved_sym = saved.get(ticker)
             saved_exchange = _isin_acceptable(saved_sym, expected)
@@ -537,7 +624,7 @@ def run_sync(db_path: str = DB_PATH) -> dict:
             "no_data": 0,
             "invalid": 0,
             "failed": 0,
-            "unmapped": unmapped_count,
+            "unmapped": unmapped_count + missing_members,
             "resolved_by_isin": 0,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }

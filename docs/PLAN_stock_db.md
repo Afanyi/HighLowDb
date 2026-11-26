@@ -456,7 +456,7 @@ private metadata/sample artifacts. No blocking findings or credible security iss
 
 ### Phase 2: Correct the five stored values
 
-**Status:** Done — Passed Review
+**Status:** In Progress — owner-approved amendment (2026-11-26): US Yahoo symbols from Trading 212 `shortName`
 **Depends on:** Phase 1
 
 #### Goal
@@ -648,7 +648,7 @@ staleness test checks only the schedule label; the stock status still shows a we
 
 ### Phase 3: Select the 1,000-stock universe
 
-**Status:** Not Started
+**Status:** Blocked — owner decision needed: stale Trading 212 tickers break symbol mapping in Phase 2 sync and Phase 3 selection
 **Depends on:** Phase 2
 
 #### Goal
@@ -703,6 +703,118 @@ environment with no live database writes, measuring runtime and peak memory.
 #### Security Check
 
 Confirm selection has no public route, review files are private and CSV text is escaped.
+
+#### Review Result (2026-11-26)
+
+**Blocked — Security**, with additional functional blockers. Reviewed the uncommitted diff
+(`universe_select.py`, `tests/test_universe_select.py`, `sync.py`, `Dockerfile`,
+`deploy/release.py`). 250 unittests pass on the host; the plan's isolated run and the
+owner-approved real selection were not performed. The phase was never set to In Progress and
+has no execution evidence.
+
+Security (confirmed by code inspection):
+
+1. `write_review_csv` writes Trading 212 names, tickers and other provider text with plain
+   `csv.writer`; values starting with `=`, `+`, `-`, `@`, tab or CR are not escaped. Section 7
+   and this phase's Security Check require CSV formula escaping.
+2. The default output `universe_review.csv` is created in the working directory (the repo),
+   which `.gitignore` does not cover, so the private review file can be committed. Use a
+   Git-ignored private location (for example `data/`) and keep the 0600 mode.
+
+Functional blockers (reproduced where noted):
+
+3. Quota overflow (reproduced): 300 current US members with no non-members selects **260** US
+   stocks (quota 200). The buffer must decide which members are *eligible* to stay (rank within
+   1.3 × quota among all candidates); seats taken must never exceed the quota.
+4. Screening window (reproduced): `_apply_gates` and `compute_ryz63` use the whole `period=max`
+   history, not the last 63 sessions. A stock with zero volume for its last 63 sessions passed.
+   Trading-day percentage is therefore meaningless. New-listing detection ("first bar in the
+   current year") does not implement "68 sessions, skip 5".
+5. No home-listing resolution: the screening symbol is the chosen T212 line's own symbol, and
+   `_validate_home_listing` checks only that a name exists (no ISIN/name/country/exchange
+   agreement). Issuers offered only via foreign lines (most JP/AU/Nordic) can never qualify.
+   Line choice falls back to the first line, not the highest median EUR traded-value line.
+6. RYZ63 is not Yang-Zhang: variances are centred on the median, the close-to-close variance
+   replaces the Rogers-Satchell term, and `k` is wrong (`0.34 / (1.34 + (n+1)/(n-1))`).
+7. FX: currency comes from the T212 line, not the home listing; Yahoo `GBp` is not normalized;
+   `_fx_rate_on_or_before` scans and sorts the full ECB history on every call (per session per
+   candidate), and has no staleness bound.
+8. Missing gates: no split-like-jump detection (high/low >= 3 is labelled as one), no softer
+   current-member thresholds.
+9. No resumable progress; `job_guard` is imported but unused, so selection takes no lock.
+10. Review CSV omits stocks rejected before ranking (gates, FX, listing) and unfilled seats.
+11. Sync restriction: `run_sync` defaults to `approved_only=False` and `app.py` calls it that way,
+    so the manual sync still updates every instrument. `_run_sync_approved_only` duplicates
+    the sync loop and drops Phase 2 behavior: symbol overrides, the ISIN fallback, saved-symbol
+    exchange validation, the override flags. Filter `work` inside `run_sync` instead.
+12. Fixtures required by the criteria (bad tick, duplicate listing, IPO, reverse split,
+    interruption, determinism) were not checked against the above defects; `--no-network` is a
+    stub; `deploy/release.py` has stray whitespace.
+
+#### Rework Evidence (2026-11-26)
+
+Rewrote `universe_select.py` and its tests; all review findings above are addressed.
+
+- Security: every CSV text cell starting with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`
+  (`approve` reverses it). Review, country-summary and progress files are created `O_EXCL |
+  O_NOFOLLOW` with mode 0600 in a 0700 directory, by default `<db dir>/universe/`, which is now
+  in `.gitignore`. The app has no selection route (tested); logs name only ISINs and error types.
+- `select` groups Trading 212 STOCK lines by ISIN (23 countries; ETFs, warrants, funds and
+  non-quota ISIN prefixes dropped). The home listing comes from a Trading 212 line already on
+  the home exchange, else Yahoo's ISIN search, and is accepted only when Yahoo's company country,
+  home-exchange suffix (US: national exchanges, no OTC) and name agree, with exactly one match.
+- Gates use only the latest 63 completed sessions of one year of home history (new listing:
+  first 5 sessions skipped, 68 needed); invalid OHLC, high/low >= 3 (bad tick) and an overnight
+  gap >= 3x either way (split-like jump) exclude; member thresholds are the softer set.
+  Traded value converts each session with that day's ECB rate or the latest earlier one at most
+  7 days old (never later); GBX/GBp and ILA are divided by 100 first; a gap means `missing_fx`.
+- RYZ63 is Yang-Zhang (overnight, open-close and Rogers-Satchell, k = 0.34/(1.34+(n+1)/(n-1)),
+  annualised by 252) with each component clipped at median ± 6 scaled MAD; tested against the
+  formula. Allocation retains eligible members ranked within floor(1.3 x quota), never more than
+  the quota, then fills by rank (ties by ISIN). Unfilled seats get `supply` or
+  `too_few_pass_gates` in the country summary.
+- Line choice: home line, else the only line, else highest median EUR traded value.
+- Progress is saved every 25 ISINs and on any interruption; `--resume` reuses it for at most
+  7 days and only for ISINs still offered. Provider errors are reported and retried on resume.
+- `approve REVIEW_CSV` validates every SELECTED row (patterns, country = ISIN prefix, unique,
+  quotas, still a priceable Trading 212 STOCK line for that ISIN) and replaces
+  `universe_members` in one transaction under `refresh.job_guard`.
+- `run_sync` syncs approved STOCK members only and returns before calling Trading 212 or Yahoo
+  when there are none; the duplicate `_run_sync_approved_only` loop was removed, so overrides,
+  ISIN fallback and Phase 2 fallbacks apply to members. Shared helpers `completed_sessions`,
+  `yahoo_line` and `override_matches` live in `sync.py`; `_Yahoo` gained paced `search`/`info`.
+  Existing sync tests now approve their stocks; ETF sync expectations changed accordingly.
+- Verification: the full unittest suite (about 250 tests; an earlier "289" was an arithmetic
+  error) passed on the host and in the app image (`--network none`,
+  `--read-only`, tmpfs, dummy keys, databases in `/tmp`); `git diff --check` passed.
+  **Not run:** the owner-approved real selection (needs the demo Trading 212 key, ECB and
+  roughly three Yahoo requests per ISIN for about 8,200 ISINs).
+
+#### Real Selection Run (2026-11-26, owner-approved)
+
+Demo Trading 212 key, full ECB history, live Yahoo; isolated container (512 MiB, 1 CPU,
+read-only, temporary database, only the three T212 variables passed). Exit 0 in 15,545 s
+(4 h 19 min); peak memory 135 MiB. 8,246 ISINs screened, 3,471 eligible, **934 selected**
+(934 unique ISINs, US 200, no ETF). Review files 0600 in a 0700 directory, outside the repo.
+Unfilled: NL 13, IL 24, DK 1, IE 7, SG 11, IT 4, NZ 5, HK 1 (all `too_few_pass_gates`).
+Exclusions: unverified home listing 1,701; illiquid 1,257; no home listing 646; provider
+error 377 (Yahoo HTTPError, retryable with `--resume`); invalid OHLC 234; others smaller.
+
+**Findings that block acceptance:**
+
+1. **Stale Trading 212 tickers.** The instrument `ticker` keeps old symbols; the metadata field
+   `shortName` holds the current one (WWE_US_EQ -> TKO, CSWI -> CSW, SYX -> GIC, FSRV -> KPLT,
+   and the Phase 1 cases ACIC -> ACHR, GOLD -> B). 1,318 of 5,822 demo US stock lines differ.
+   Selection therefore rejects many real US companies as unverified, and **Phase 2's sync maps
+   the same stale symbols**, which can fetch a different company that now uses the old symbol
+   (as GOLD did). The seven manual overrides cover only part of this.
+2. **ISIN search misses home listings.** Yahoo's ISIN search returned only `ICL` (NYSE) for ICL
+   Group, while a name search returns `ICL.TA`; most IL/SG/IE/NL `no_home_listing` results
+   are unexamined for this. Some are correct (Flex, Trinseo have no home listing).
+3. UK `invalid_ohlc` (195) is unexamined; it may be genuine Yahoo unit errors or overly strict.
+
+Changing symbol mapping touches Phase 2 (Done — Passed Review), so the owner must decide the
+fix before Phase 3 continues.
 
 ### Phase 4: Add independent validation
 
