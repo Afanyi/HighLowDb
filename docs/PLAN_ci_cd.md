@@ -536,7 +536,7 @@ but remains `Not Started`; the plan remains active because that phase is unfinis
 
 ### Phase 3: Validate and enable production deployment; finish operator docs
 
-**Status:** Not Started
+**Status:** Blocked — smoke fix verified locally; updated dev publication/hosted pass and stock release approval pending
 **Depends on:** Phase 2
 
 #### Goal
@@ -545,8 +545,9 @@ Enable tested `main` deployment against an approved compatible release and verif
 
 #### Scope
 
-Read-only readiness inventory, required GitHub configuration, one monitored automatic rollout,
-local fallback rehearsal, and updates to README, rollout/deployment docs and this plan's evidence.
+Read-only readiness inventory, hosted verification and necessary CI runner compatibility fixes,
+required GitHub configuration, one monitored automatic rollout, local fallback rehearsal, and
+updates to README, rollout/deployment docs and this plan's evidence.
 
 #### Do Not Change
 
@@ -604,3 +605,122 @@ Run the local dry run, isolated fallback/rollback checks and `git diff --check`.
 
 Confirm secret-free logs/artifacts, actual branch/environment restrictions, SSH trust,
 private upstream/authentication and no unexpected shared-service or permission changes.
+
+#### Readiness Inventory and Blockers (2026-11-27)
+
+- Confirmed dependency: Phase 2 is `Done — Passed Review`. Read the complete phase and
+  acceptance criteria, checked the active plans' release boundaries and set `In Progress`
+  before this read-only inventory. The local working tree was initially clean.
+- Candidate: local `dev`, commit `ff0a082dd58980c4bd173c0fb0c8c93fd7eaeee3`.
+  CI/CD commits `dd09ba8` (verification) and `ff0a082` (guarded deployment) are committed
+  locally by the owner but remain unpublished. No commit or push was performed by this agent.
+- Fresh `git ls-remote --heads origin` returned remote `dev` at
+  `5b19f9ca48c47b9eccca48b92eb678484f9f7b6b` and remote `main` at
+  `982f469fcc7b192e23b34009eab1bfaefb106c87`. Thus neither remote branch has the CI/CD commits.
+- Public GitHub REST inventory returned **0 workflows** and **0 Actions runs** for
+  `Afanyi/HighLowDb`. No hosted passing, failing, disabled-deployment or non-main workflow
+  evidence exists yet. Publication to a non-main branch and successful hosted verification
+  are prerequisites; tests can run there without enabling deployment.
+- The stock plan still records Phase 2 `In Progress`, Phase 3 `Blocked`, and Phases 4/5
+  `Not Started`. `docs/REBUILD_REPORT.md` does not exist. There is no recorded Phase 5
+  approved report, migration rehearsal or reviewed stock release for this candidate.
+  CI/CD section 3 explicitly requires that activation "waits for that plan's Phase 5
+  approval and reviewed release" when unreleased stock behavior is included. Starting CI/CD
+  Phase 3 does not waive those separate data/release approvals or authorize stock-plan work.
+- No authenticated GitHub administration tool is currently available (`gh` absent and
+  `GH_TOKEN`/`GITHUB_TOKEN` unset; token values were not read or printed). Public endpoints
+  suffice for the inventory above. Actual repository/environment variables, secret-name
+  presence, branch protections and the production environment's settings remain unverified;
+  do not infer that the owner has not configured them. No settings were changed.
+
+**Required before resuming activation:**
+
+1. Publish the existing CI/CD commits to a non-main branch and obtain hosted verification
+   results with automatic deployment disabled. Publishing/merging is not authorized by
+   this inventory; do not manufacture a successful hosted result from local test evidence.
+2. Complete the stock plan's required report/migration/release approval for the exact
+   candidate, following that plan's own dependencies and scope. Do not bypass compatibility
+   gates or silently approve the stock release as part of CI/CD activation.
+3. Establish authenticated GitHub settings verification/administration, verify the actual
+   production environment and trusted SSH configuration privately, then carry out this
+   phase's monitored rollout, disablement test, local fallback rehearsal and operator evidence.
+
+No production SSH, provider request, live database operation, server change, GitHub setting
+change, secret upload, enablement, merge or deployment occurred. Existing local/manual
+deployment remains available with its mandatory checks and stock-release approval requirements.
+Earlier local regression/rollback evidence remains recorded under Phases 1/2; no additional
+local suite or dry run was repeated after the blocking prerequisites were established.
+No Phase 3 acceptance criterion is marked passed. The phase and plan remain unfinished.
+
+#### Hosted dev Failure Investigation (2026-11-27)
+
+- Owner reported the failed `dev` pipeline. Public Actions inventory now confirms push run
+  [45981224379](https://github.com/Afanyi/HighLowDb/actions/runs/45981224379) for commit
+  `ff0a082dd58980c4bd173c0fb0c8c93fd7eaeee3`. This supersedes the earlier unpublished-commit
+  and zero-workflow/run readiness blocker; the earlier inventory is retained as dated history.
+- Checkout succeeded. The **Application and deployment checks** job failed in **Run application
+  and deployment checks**, from `2026-11-27T10:20:16Z` to `10:22:45Z`. The **Deploy production**
+  job was **skipped**. This supplies real hosted evidence that the failed dev verification did
+  not enter deployment; it is not a passing hosted verification or production-rollout result.
+- Public check annotations report only `Process completed with exit code 1.` They do not
+  identify a failing internal command, assertion or dependency. The logs-download endpoint
+  returns HTTP 403 without authentication. No root cause has been claimed from the exit code.
+- No installed GitHub plugin or authenticated CLI/token is currently available. The plugin
+  directory does offer GitHub CI debugging; it was suggested for authenticated access, with
+  no connection claimed. Requested the final error lines from the failed step as an alternate
+  diagnostic source. Do not request or paste a production key/token to obtain those logs.
+- The existing runner and Docker drills were inspected for runner differences. No code or
+  security gate was changed speculatively without the detailed failure evidence. Previously
+  passing local checks are not treated as reproducing this hosted failure.
+- Next: obtain the actual error through authenticated logs or the owner's excerpt, reproduce
+  it with a targeted fixture/environment, make the smallest CI-scoped correction, and verify
+  it before requesting another authorized dev push/run. Stock release/report approval remains
+  separately required before production activation. No GitHub setting, secret, production
+  server, deployment, commit or push was changed by this investigation.
+
+#### Authenticated Log Diagnosis and CI Compatibility Repair (2026-11-27)
+
+- The owner installed and connected the GitHub plugin. Authenticated job-log retrieval now
+  succeeds; this supersedes the missing-log/plugin limitation above. The existing stock
+  release approval and unverified administration settings remain separate activation blockers.
+- Hosted logs show 258 application tests, 36 deployment tests and all real Docker deployment
+  drills passed. Failure occurs at the first production smoke-test Compose configuration
+  command. Hosted Compose is **v2.38.2**, compared with local **v5.3.1**.
+- Reproduced with the official v2.38.2 binary, verified against its published SHA-256, and
+  disposable copies of both Compose files without a `.env`: the existing command exits 1
+  with `env file .../.env not found`. Setting test-only `APP_ENV_FILE=/dev/null` makes that
+  exact command exit 0. `--env-file /dev/null` controls interpolation but does not select
+  the app service's separate `env_file`; `--no-env-resolution` alone is insufficient here.
+- Checked the whole plan against this finding. The narrow smoke-test compatibility repair
+  belongs to Phase 3 hosted verification; completed Phase 1/2 evidence is retained with its
+  local-version limits. No application/data behavior, mandatory check, CI failure handling,
+  deployment gate, real environment or production approval requirement changes.
+- Set Phase 3 `In Progress` for the confirmed repair. Production activation remains blocked;
+  repair verification and another hosted dev result are still pending.
+
+#### Repair Verification and Remaining Blockers (2026-11-27)
+
+- `tests/check_production.py` now supplies test-only `APP_ENV_FILE=os.devnull`, alongside
+  its existing dummy settings and no-env-resolution option. Both Compose files and all
+  application/deployment behavior remain unchanged. No real `.env` was created or copied.
+- **Passed:** the full production smoke test under Compose **v2.38.2** and host Python 3.12,
+  using a disposable source copy without `.env`. Only Compose commands were routed to the
+  checksum-verified older binary; Docker operations used the ordinary local daemon. All
+  existing production-config assertions, verified TLS, missing/wrong authentication checks,
+  both dataset/health routes and both routes' CSRF/origin checks passed. The test cleaned up
+  its own containers/network. An initial sandbox-only Docker access failure was rerun with
+  approval; it is not counted as a test pass.
+- **Passed:** the same empty-service-env configuration renders with local Compose **v5.3.1**;
+  assertions confirm no published app port and an explicit `/dev/null` service env-file path.
+  Fresh `python3 -m unittest tests.check_ci tests.check_deploy -q` passed **39 tests**;
+  `git diff --check` passed. The previously successful hosted 258 application tests and Docker
+  deployment drills were not repeated because this repair changes only smoke-test configuration.
+- Same-session scoped review found no unrelated implementation changes or credible security
+  issue. Mandatory checks, authentication/CSRF assertions, strict failure handling, main-only
+  deployment and server-side secrets/approval requirements remain intact. No test was skipped
+  or made allowed-to-fail to address this error.
+- Phase 3 remains incomplete: the owner must publish the local repair to `dev` for fresh
+  hosted verification; this task did not commit/push or rerun the unchanged failing revision.
+  A passing hosted run is not claimed. Stock-plan report/release approval and the remaining
+  configuration/monitored-production acceptance criteria still block activation. No GitHub
+  setting, secret, production server, deployment or other plan phase was changed.
