@@ -2,7 +2,8 @@
 
 Phase 1 prepares production configuration and tests protected access. It does not
 install this application, modify DNS or change the live TradingSupport proxy.
-The manual setup/update tooling is documented in [deploy/ROLLOUT.md](../deploy/ROLLOUT.md).
+The local setup/update tooling and guarded GitHub Actions deployment are documented in
+[deploy/ROLLOUT.md](../deploy/ROLLOUT.md).
 The actual rollout remains Phase 4 in
 [PLAN_deployment.md](done/PLAN_deployment.md).
 
@@ -66,7 +67,7 @@ is still a rollout decision. No database has been moved or changed by Phase 1.
 
 Required server environment settings, in this app's private `.env` only:
 
-- `APP_RELEASE`: set by the manual deployment tool, not included in the input environment file.
+- `APP_RELEASE`: set by the deployment tool, not included in the input environment file.
 - `APP_PUBLIC_ORIGIN=https://stocks.skyboyz1.duckdns.org`: exact HTTPS origin,
   with no path, credentials, explicit port or trailing slash.
 - `APP_SECRET_KEY`: at least 32 randomly generated characters, kept stable across

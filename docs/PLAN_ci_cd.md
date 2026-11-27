@@ -106,7 +106,9 @@ One workflow with unprivileged verification and a dependent deployment job:
 4. Provide a dedicated SSH key only to the deployment job, using a production environment
    where supported. Proposed settings: secret `DEPLOY_SSH_KEY`, variable `DEPLOY_HOST`
    and a verified `DEPLOY_KNOWN_HOSTS` value. Materialize private temporary SSH settings/key
-   and ignored `deploy/server.env`; run `bash deploy/update.sh` and clean up credentials.
+   outside the checkout; run `bash deploy/update.sh --server-config ...` and clean up credentials.
+   This Phase 2 design supersedes writing the CI settings to ignored `deploy/server.env`,
+   preserving that file for local use and keeping the verified checkout clean.
    Do not obtain host trust from an unverified in-job `ssh-keyscan`.
 5. Serialize production jobs with one concurrency group and `cancel-in-progress: false`.
    Before SSH, reject a run whose event SHA is no longer the remote `main` head, including
@@ -359,7 +361,7 @@ remains `Not Started`; the plan stays active because Phases 2 and 3 are unfinish
 
 ### Phase 2: Add guarded deployment through the existing updater
 
-**Status:** Not Started
+**Status:** Done — Passed Review
 **Depends on:** Phase 1
 
 #### Goal
@@ -370,6 +372,9 @@ Add the automatic deployment path with its enablement switch off and retain loca
 
 The workflow deployment job, minimal deployment integration/messages and meaningful additions
 to `tests/check_deploy.py` for any changed client behavior. Document proposed GitHub settings.
+The client-only `deploy/ci.py` integrates the workflow with `deploy/update.sh`; an optional
+private SSH settings path preserves existing local configuration without creating another
+server-side deployer.
 
 #### Do Not Change
 
@@ -428,6 +433,106 @@ Record the exact evidence for each criterion; do not claim a fake transport prov
 
 Review secret scoping, temporary file permissions/cleanup, strict host trust, source identity,
 shell quoting and all failure paths. Confirm no CI change weakens server checks or sudo policy.
+
+#### Execution Evidence (2026-11-27)
+
+- Dependency confirmed: CI/CD Phase 1 is `Done — Passed Review`. Read the full active CI/CD
+  plan, the phase and its acceptance criteria; stock-plan application/data approval boundaries
+  are preserved. Set Phase 2 `In Progress` before implementation. No Phase 3 work was started.
+- Added the workflow's `deploy` job with `needs: [verify]` and an explicit condition requiring
+  a `push`, `refs/heads/main`, repository `ENABLE_AUTO_DEPLOY == 'true'` and verification result
+  `success`. Both jobs check out the immutable event SHA with credentials persistence disabled.
+  Verification remains independent of deployment settings; only the production deployment
+  step receives the dedicated SSH secret and built-in read-only GitHub token.
+- Production jobs share `allstocks-production`, with `cancel-in-progress: false`, while
+  retaining the server's existing local/CI deployment lock. No switch value, GitHub environment,
+  branch rule, production secret or server access policy was created or changed in this phase.
+  Missing/false enablement continues to disable automatic deployment by default.
+- Added `deploy/ci.py`: independently validates event/ref/repository/enablement/result, requires
+  a clean checkout matching the event SHA, checks current `main` through the fixed GitHub REST
+  endpoint, validates credentials, builds the existing local image and rechecks `main` before
+  invoking the ordinary updater. Stale queued runs, old reruns, unknown source and GitHub API
+  failure stop without SSH. No personal access token or new dependency is required.
+- The client creates a 0700 temporary directory and 0600 key, known-host and settings files.
+  Native `ssh-keygen` validates an unencrypted private key and matching host entry; hashed host
+  entries are supported. Temporary credentials are removed on successful/failed execution and
+  are outside the source/build context. Private-key values, host-key content and GitHub tokens
+  are removed from child-process environments. Raw tool output/exception text is not published;
+  logs and the Actions summary contain only validated commit/release identifiers and outcome/stage.
+- The updater accepts optional `--server-config`; default `deploy/server.env` behavior remains.
+  The new optional `AS_KNOWN_HOSTS` requires a private file and `AS_KEY`; explicit CI trust uses
+  `-F /dev/null`, its own known-host file, no global known-host file, `IdentitiesOnly=yes` and
+  `IdentityAgent=none`, retaining strict host checking and destination identity checks.
+  CI invokes update without `--env`, setup, recovery or skip/force flags. Existing source and
+  server-candidate tests, drain timeout, locks, backup, schema/count checks, health and rollback
+  remain mandatory and unchanged. Local updates do not require a GitHub token or switch.
+- Added the client helper to the existing release allowlist so packaged deployment tooling and
+  host-side regression tests include it. No runtime Dockerfile, application, provider, database,
+  schedule or sudo/SSH policy changed. Updated deployment messages, README, rollout/configuration
+  notes and the SSH settings example, including the four GitHub settings and failure handling.
+- **Focused checks passed:** 39 tests combined (`tests.check_ci` = 3, `tests.check_deploy` = 36).
+  New tests cover ineligible PR/other-branch/tag/disabled/failed/skipped/cancelled/missing results;
+  stale or dirty/wrong checkouts; `main` advancing during build; missing settings/API failure;
+  invalid private keys; mismatched/fingerprint/hashed host entries; failed builds/updates;
+  missing release confirmation; safe reports; key file permissions/cleanup and explicit trust
+  without changing local SSH settings. Existing client tests still prove failed mandatory
+  local tests and destination identity mismatch stop before upload/cutover.
+- **Workflow validation passed:** actionlint 1.7.12 and evaluation of the actual job condition
+  across 180 event/ref/enablement/verification-result combinations. Additional YAML assertions
+  confirm `needs`, both immutable checkouts, isolated verification, explicit failure handling,
+  production environment and non-cancelling concurrency. These are configuration/fixture checks,
+  not a claim of real GitHub scheduler or deployment execution.
+- **Complete sequence passed:** `bash tests/check_ci.sh`, exit 0: 3 CI regression tests,
+  258 offline application tests, 36 host deployment tests, the isolated real Docker setup/update,
+  corrupt-stage/active-job refusal, failed-cutover rollback, explicit recovery and unaffected
+  sentinel checks, plus HTTPS/login/CSRF smoke checks and the packaged-source dry run.
+  Dry-run release: `11aa82b01e5f5b1e`, private `/tmp/allstocks-release-ql72bs_w/review`.
+- Native offline `ssh -G` confirmed the explicit strict trust/identity/agent options parse as
+  intended without connecting. Python AST, source whitespace, actionlint and `git diff --check`
+  passed. Scoped security inspection identified no credible issue or weakened deployment gate.
+- **Not run:** hosted Actions jobs, real GitHub-token API access, actual scheduler concurrency,
+  production SSH/credential validity or a live deployment. These remain Phase 3 checks; mocks
+  and local Docker fixtures are not represented as live evidence. No production connection,
+  GitHub setting change, commit, push or activation occurred. Phase 2 awaits review; Phase 3
+  remains `Not Started`.
+
+#### Review Result (2026-11-27)
+
+**Done — Passed Review.** Reviewed the whole CI/CD plan for consistency, the current Phase 2
+diff and client helper, and all acceptance criteria. The existing stock-plan release/migration
+approvals still govern activation. No blocking, optional or credible security finding remains.
+The implementation reuses the existing updater and its server-side gates; it introduces no
+alternative cutover path, framework, service or runtime dependency.
+
+| Acceptance criterion | Review evidence | Result |
+| --- | --- | --- |
+| Only a successfully verified event SHA can deploy | `needs: [verify]`, explicit success result, identical immutable checkout refs, independent helper eligibility/source checks | Passed: implementation/configuration |
+| Failed/skipped/cancelled/missing checks prevent deployment | Fresh 180-case evaluation of the actual workflow condition plus runner failure regressions and helper ineligibility tests | Passed: configuration/fixtures |
+| Passing non-main pushes/PRs never receive deployment credentials | Job condition excludes these events before the production job; verify job has no deployment environment or secret references | Passed: configuration |
+| Local mandatory tests still block failed releases | Existing real-CLI fake-transport regression confirms test failure stops before SSH; default local settings remain independent of GitHub | Passed |
+| Stale revisions rejected; active jobs not cancelled; shared lock preserved | Before/after-build main checks tested, including old reruns and advancing main; static concurrency group has cancellation disabled; ordinary updater enters unchanged server lock | Passed: code/fixtures/configuration |
+| Invalid settings/trust/target/deployment fail | Native test-key/host validation, mismatched/fingerprint/hashed host cases, file privacy tests, existing destination-identity checks and failed-updater tests | Passed |
+| Existing updater, server environment and safety gates preserved | CI invokes update without `--env`; lock/drain/snapshot/compatibility/health/rollback logic unchanged; prior real Docker drill proves rollback/data/environment preservation | Passed |
+| Local update/dry-run/recovery/Compose remain available | Optional SSH-config argument preserves default client behavior; local tests and prior dry-run/recovery drill passed; Compose files unchanged | Passed |
+| Safe source/release outcome reporting | Validated hash fields and constant status/stage text only; raw tool/exception output withheld; tests assert token/private-key/error exclusion and temporary-key cleanup | Passed |
+
+Fresh review verification passed: **39 focused tests** (3 CI runner and 36 deployment tests),
+actionlint 1.7.12, separate Bash syntax checks, `git diff --check` and the 180 workflow-condition
+cases. Compared the current helper, manager, release packager, deployment tests and operator docs
+byte-for-byte with the allowlisted source from the successful full verification run above.
+The prior **258 application tests**, Docker setup/update/rollback/recovery, HTTPS/CSRF and release
+dry-run evidence therefore applies; those expensive suites were not repeated during this review.
+Preserved the pre-existing, comment-only `.env.example` edit rather than treating it as phase work.
+
+Reconciled the older strategy's proposed CI write to `deploy/server.env` with the implemented
+temporary `--server-config` design; the superseded path is marked explicitly above. This review
+changed only plan status/consistency/evidence, not implementation or GitHub/server configuration.
+
+Limits: this is a same-session review, not independent external review. Hosted Actions execution,
+live token/SSH validity, real scheduler concurrency and the approved production rollout remain
+**not verified** and belong to Phase 3. No criterion was waived or presented as tested live.
+No commit, push, secret change or deployment occurred. Phase 3 is now eligible by dependency
+but remains `Not Started`; the plan remains active because that phase is unfinished.
 
 ### Phase 3: Validate and enable production deployment; finish operator docs
 

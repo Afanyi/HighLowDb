@@ -58,8 +58,12 @@ The host-side checks use only Python's standard library; application dependencie
 Tests use dummy credentials and disposable databases. They need no `.env`, SSH key or production
 access. The drills remove only their own temporary resources; test images/build cache and the
 private release dry-run directory may remain for inspection. Local development and manual server
-deployment commands remain available. This workflow currently performs verification only;
-automatic deployment is added in CI/CD Phase 2 and enabled after Phase 3 validation.
+deployment commands remain available. Automatic deployment is disabled unless the repository
+variable `ENABLE_AUTO_DEPLOY` is exactly `true`; leave it `false` until CI/CD Phase 3 validation.
+Only a `main` push whose verification succeeds can enter the `production` deployment job.
+The job rejects superseded commits, serializes automatic updates and runs the existing updater
+with temporary SSH credentials. Application/provider secrets stay in the server's private `.env`.
+See [deployment settings and failure handling](deploy/ROLLOUT.md#github-actions-deployment).
 
 ## Server deployment preparation
 
@@ -68,7 +72,7 @@ server. [Production configuration notes](docs/deployment.md) describe the privat
 Compose upstream and the proposed route for its existing Caddy proxy. These files
 prepare deployment. Manual setup/update scripts are documented in
 [deploy/ROLLOUT.md](deploy/ROLLOUT.md); the live rollout remains Phase 4.
-Code deployment stays manual. Automatic stock-data updates continue to use the
+Code deployment supports both the local updater and guarded GitHub Actions. Automatic stock-data updates continue to use the
 existing weekday `SYNC_TIME_UTC` scheduler, independently of browser access.
 
 The dashboard shows the next scheduled refresh, last attempt, last successful

@@ -1,4 +1,4 @@
-"""Manual deployment only. Local entry points are setup.sh and update.sh."""
+"""Application deployment through setup.sh/update.sh, locally or from guarded CI."""
 
 import argparse
 from contextlib import contextmanager
@@ -375,7 +375,7 @@ def apply(root, stage, setup=False, drain_timeout=300, health_timeout=60):
                     docker("volume", "rm", VOLUME)
                     shutil.rmtree(root)
             raise
-        print("Installed " + candidate["release"] + "; stock/crypto scheduling resumed. Code updates remain manual.", flush=True)
+        print("Installed " + candidate["release"] + "; deployment checks passed.", flush=True)
         return candidate
 
 
@@ -413,7 +413,8 @@ def local(args):
     if args.dry_run:
         print("Dry run complete: no SSH, environment file read/upload, or deployment.")
         return
-    cfg = settings(source / "deploy/server.env", {"AS_HOST", "AS_KEY"})
+    config = getattr(args, "server_config", None) or source / "deploy/server.env"
+    cfg = settings(Path(config), {"AS_HOST", "AS_KEY", "AS_KNOWN_HOSTS"})
     host = cfg.get("AS_HOST", "")
     if not re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*", host):
         raise ValueError("AS_HOST must be a safe SSH alias or user@hostname")
@@ -422,6 +423,15 @@ def local(args):
         key = Path(cfg["AS_KEY"]).expanduser()
         release.private_file(key, os.getuid())
         options += ["-i", str(key)]
+    if cfg.get("AS_KNOWN_HOSTS"):
+        if not cfg.get("AS_KEY"):
+            raise ValueError("Explicit host trust requires AS_KEY")
+        known = Path(cfg["AS_KNOWN_HOSTS"]).expanduser()
+        release.private_file(known, os.getuid())
+        # Explicit CI settings must not inherit a developer's SSH aliases/agent/trust.
+        options += ["-F", "/dev/null", "-o", "UserKnownHostsFile=" + str(known),
+                    "-o", "GlobalKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes",
+                    "-o", "IdentityAgent=none"]
     if args.command == "setup" and not args.env:
         raise ValueError("First setup requires --env /absolute/path/to/private-app.env")
     if args.env:
@@ -479,6 +489,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--env", help="Explicitly install/replace only this app's private environment file")
     parser.add_argument("--test-image", default="allstocksdatabase-app:latest", help="Cached local dependency image")
+    parser.add_argument("--server-config", help="Private SSH settings file; defaults to deploy/server.env")
     parser.add_argument("--drain-timeout", type=int, default=300)
     args = parser.parse_args()
     if not 0 <= args.drain_timeout <= 86400 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", args.test_image):
