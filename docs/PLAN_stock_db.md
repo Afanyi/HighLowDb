@@ -994,10 +994,128 @@ Run recorded-fixture tests with no live calls, then the full suite.
 
 Confirm fixed HTTPS hosts, encoded symbols and no key in logs, stored errors or fixtures.
 
+### Phase 4b: Accept the reviewed additive stock schema in the deploy check
+
+**Status:** Done — Passed Review
+**Depends on:** Phase 2
+
+#### Goal
+
+The updater's compatibility check accepts exactly the reviewed additive stock schema change
+from Phase 2 and still refuses every other schema or row-count change. This is deployment
+tooling only; it does not release anything.
+
+#### Owner Decision (2026-11-27)
+
+Main run [45993051015](https://github.com/Afanyi/HighLowDb/actions/runs/45993051015) (release
+`2638b1ea632b0956`) was refused by `deploy/data.py check`. A read-only diff on a disposable copy
+of backup `20261127T114905-4317a0a6` showed the only differences: six nullable columns added
+to `stocks` (`current_price`, `price_date`, `isin`, `country`, `verification`,
+`quality_flags`) and a new empty `universe_members` table. Existing row counts were unchanged.
+The owner chose to teach the check this reviewed migration rather than migrate by hand
+(option 1), **tooling only**: no production deploy before Phase 5 approval, because the new app
+shows stock `current_price`, which stays empty on live data until the approved release and sync.
+This keeps Phase 5's approval order and the CI/CD plan's ban on unreviewed migrations.
+
+#### Scope
+
+`deploy/data.py` (`check`) and deployment regression tests (`tests/check_deploy.py`,
+`tests/check_deploy_docker.py` as applicable).
+
+#### Do Not Change
+
+`sync.init_db` schema, live data, `deploy/manage.py` cutover/rollback flow, the
+`ENABLE_AUTO_DEPLOY` switch, crypto and refresh databases.
+
+#### Reuse First
+
+The existing `describe()` before/after comparison in `deploy/data.py` and existing deploy test
+fixtures.
+
+#### Steps
+
+1. Inspect `deploy/data.py`, the deploy tests and `sync.init_db` migrations.
+2. Add one explicit reviewed list in `deploy/data.py`: per database and table, the exact
+   expected `CREATE` SQL after migration and the allowed new tables. Keep it data, not logic.
+3. In `check`, still fail unless every before/after difference matches that list exactly:
+   existing tables keep identical row counts, allowed new tables are empty, other databases
+   are unchanged, and an already migrated database (no difference) still passes.
+4. Add regression tests: old schema → migrates and passes; migrated → passes; any other
+   column/table/SQL change, a row-count change or a non-empty new table → refused.
+5. Prove rollback safety: `restore()` reruns the previous image on the migrated live volume,
+   so the previous release (`c9bad96e9fd67e20`) must start and pass its `check` and health
+   on a migrated copy. Rehearse in an isolated, network-disabled container on a disposable copy.
+
+#### Acceptance Criteria
+
+- `deploy/data.py check` with the candidate image passes on a copy of backup
+  `20261127T114905-4317a0a6` and still raises
+  `Database schema/count change requires a reviewed migration` for any unlisted change.
+- New regression tests cover each allowed and refused case and pass with the existing
+  deployment suites.
+- The previous release image runs its `check` successfully on a migrated copy (rollback safety).
+- No live database, deployment, workflow run or `ENABLE_AUTO_DEPLOY` change occurs; CI/CD
+  Phase 3 stays blocked until Phase 5 approval.
+
+#### Verification
+
+Run the deployment suites (`tests/check_deploy.py`, `tests/check_deploy_docker.py`), the
+offline application tests and `git diff --check`. Do the server rehearsal read-only, with
+backup mounts read-only and no network.
+
+#### Security Check
+
+Confirm the check cannot be widened by input (the allowlist is code-reviewed constants only),
+no secrets or environment files are read by the check, and backups stay private and read-only.
+
+#### Execution Evidence (2026-11-27)
+
+- `deploy/data.py`: `check` now calls `reviewed(before, after)` only when snapshots differ. It
+  accepts exactly: `stocks` DDL equal to the old DDL with `STOCK_COLUMNS` appended before the
+  closing parenthesis (or unchanged), plus a new `universe_members` whose whitespace-normalized
+  DDL equals `UNIVERSE_MEMBERS` and has 0 rows. Every other table, index, row count and the
+  crypto/refresh databases must be identical. Constants only; no input can widen it.
+- `tests/check_deploy.py`: new `test_only_the_reviewed_stock_migration_passes_the_data_check`
+  uses the exact installed-release DDL: legacy passes, already-migrated passes, backup stays
+  untouched; refused: unreviewed column, stock row added, non-empty new table, unlisted table,
+  new index, changed other database, different `universe_members` DDL. Mutation check: forcing
+  `reviewed` to `True` fails 6 subcases, forcing `False` fails the legacy case.
+- Local: `python3 -m unittest tests.check_deploy -q` **37 OK**; `python3 tests/check_deploy_docker.py`
+  OK (including the isolated failed-cutover rollback drill); app image `-m unittest` **265 OK**;
+  `git diff --check` clean. The full hosted `tests/check_ci.sh` was not run.
+- Server rehearsal (read-only backup mounts, `--network none`, private root temp dir, removed
+  afterwards; live volume not mounted): new check with candidate image `2638b1ea632b0956` on
+  backup `20261127T114905-4317a0a6` **passes**; candidate `init_db` on a disposable copy gives
+  counts `stocks 9695, yahoo_symbols 198, universe_members 0`; previous release
+  `c9bad96e9fd67e20` `check` on that migrated copy **passes** and its `app._query_rows("stocks")`
+  returns **9695** rows (rollback safety); an injected unreviewed column is **refused** with the
+  original error. Limit: the old app's HTTP health endpoint was not started on the copy; the
+  existing updater `healthy()` gate still guards real rollbacks.
+- No live data, deployment, workflow run, `ENABLE_AUTO_DEPLOY`, commit or push. CI/CD Phase 3
+  stays blocked until Phase 5 approval.
+
+#### Review Result (2026-11-27)
+
+- **Done — Passed Review.** Diff limited to `deploy/data.py` (`STOCK_COLUMNS`,
+  `UNIVERSE_MEMBERS`, `reviewed()`, one-line `check` change) and one new test in
+  `tests/check_deploy.py`; plan edits are evidence only. No `manage.py`, `sync.init_db`,
+  workflow, live data or deployment-switch change.
+- Security: the allowance is code constants only; the check still runs on disposable copies;
+  crypto/refresh databases must be identical; `reviewed()` does not mutate the returned report.
+  Rollback/recovery use each release's own `data.py`, and the rehearsal showed the previous
+  release passes its check on migrated data. No credible issue found.
+- Re-verified independently: `tests.check_deploy` **37 OK**, `git diff --check` clean. Extra
+  probes: a partial migration (only some columns) and new columns without `universe_members`
+  are refused; the full reviewed migration is accepted; the report's counts stay intact.
+- Every acceptance criterion has recorded evidence. Known limit (accepted): the old app's
+  HTTP health was not started on a migrated copy; the updater's `healthy()` gate covers it.
+- Optional, non-blocking: in the new test, `wrong_table` is a lambda assignment and the nested
+  `other_database` lacks a preceding blank line.
+
 ### Phase 5: Review, replace and release
 
 **Status:** Not Started
-**Depends on:** Phase 4
+**Depends on:** Phase 4, Phase 4b
 
 #### Goal
 
@@ -1022,7 +1140,8 @@ TradingSupport, crypto data or automatic-sync status.
 1. Build the list and values on a private database copy.
 2. Report old vs new values, change reasons, exclusions, unfilled quotas, removed rows and flags.
 3. Stop for explicit owner approval.
-4. Rehearse the migration and rollback on a copy, because the update tool stops on schema or
+4. Rehearse the migration and rollback on a copy (the update tool accepts only the Phase 4b
+   reviewed schema; it stops on any other schema or
    row-count changes.
 5. Back up, release, apply the approved migration and activate membership.
 6. Run one manual sync, verify the dashboard and update the listed docs.
