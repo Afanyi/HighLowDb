@@ -17,7 +17,7 @@ import sys
 import time
 
 
-COUNTS = {"ok", "coins", "failed", "no_data", "unmapped", "resolved_by_isin",
+COUNTS = {"ok", "coins", "failed", "no_data", "invalid", "unmapped", "resolved_by_isin",
           "backfilled", "backfill_pending", "calls"}
 STATES = {"never", "running", "completed", "partial", "failed", "interrupted"}
 
@@ -153,7 +153,8 @@ def started(db_path, mode, source, now):
 
 def finished(db_path, mode, summary, error, now):
     counts = {k: v for k, v in summary.items() if k in COUNTS and type(v) is int and v >= 0}
-    complete = not error and not counts.get("failed", 0) and counts.get("ok" if mode == "stocks" else "coins", 0) > 0
+    gaps = counts.get("failed", 0) + (counts.get("invalid", 0) if mode == "stocks" else 0)
+    complete = not error and not gaps and counts.get("ok" if mode == "stocks" else "coins", 0) > 0
     state = "failed" if error else "completed" if complete else "partial"
     with _connection(db_path) as conn:
         row = conn.execute("SELECT * FROM refresh_state WHERE dataset=?", (mode,)).fetchone()

@@ -536,7 +536,7 @@ but remains `Not Started`; the plan remains active because that phase is unfinis
 
 ### Phase 3: Validate and enable production deployment; finish operator docs
 
-**Status:** Blocked — smoke fix verified locally; updated dev publication/hosted pass and stock release approval pending
+**Status:** Blocked — candidate database compatibility requires reviewed stock migration/release approval; remaining hosted rollout checks pending
 **Depends on:** Phase 2
 
 #### Goal
@@ -724,3 +724,110 @@ No Phase 3 acceptance criterion is marked passed. The phase and plan remain unfi
   A passing hosted run is not claimed. Stock-plan report/release approval and the remaining
   configuration/monitored-production acceptance criteria still block activation. No GitHub
   setting, secret, production server, deployment or other plan phase was changed.
+
+#### Dedicated CI SSH Key Diagnosis (2026-11-27)
+
+- Subsequent hosted main run [45985720065](https://github.com/Afanyi/HighLowDb/actions/runs/45985720065)
+  for `651717afc16869721d318d47175c4f5a15392fd9` passed verification. Its first attempt
+  skipped deployment; its second attempt entered deployment with the switch enabled but
+  failed in the updater after preparing release `402914c2fef64d3f`. This supersedes the
+  pending-publication/main-verification limitation above. A successful rollout is not claimed.
+- Read-only server inspection found no new deployment stage for the failed attempt. An
+  isolated SSH hostname check using only `~/.ssh/highlowdb_github` returned
+  `Permission denied (publickey)`. The private key parses correctly, matches its `.pub`
+  and has mode 0600. No private-key value was read into logs or copied into the repository.
+- Owner attempted the recommended `ssh-copy-id -i ... live`, which incorrectly reported
+  the key already installed; the isolated SSH check still failed. Actual server inspection
+  confirms the dedicated public key is absent from `ubuntu`'s authorized keys. Existing
+  home/.ssh/authorized_keys ownership and permissions are appropriate; public-key login
+  is enabled and the configured authorized-key path is correct.
+- Local effective SSH configuration for `live` plus the dedicated `-i` includes both the
+  dedicated key and `~/.ssh/live-server.key`. The inspected `ssh-copy-id` probe retains
+  configured identity files despite `IdentitiesOnly=yes`, explaining its false positive.
+  This corrects the earlier incomplete key-installation advice; forcing that probe is
+  necessary here, not disabling SSH host verification or changing server authentication policy.
+- The owner's attempted installation authorizes adding this specific missing public key.
+  Set Phase 3 `In Progress` for that narrow credential setup and an isolated hostname test.
+  Preserve existing authorized keys, SSH/sudo/firewall policy, server application environment,
+  all deployment checks and the stock-release approval requirement. No deployment rerun or
+  production cutover is part of this repair; remaining Phase 3 criteria remain unmet.
+
+#### Dedicated Key Repair Verification (2026-11-27)
+
+- Executed the owner's intended public-key installation with `ssh-copy-id -f -i
+  ~/.ssh/highlowdb_github.pub live` after confirming the exact key was missing. It reported
+  **one key added**. The force option bypasses the misleading already-installed probe;
+  it does not replace authorized keys or disable SSH authentication/host checking.
+- A fresh connection with `-F /dev/null`, only the dedicated identity, no identity agent,
+  no control socket, batch mode and strict host verification succeeded against
+  `ubuntu@92.5.106.5` and reported hostname `tradingsupport-vnic`.
+- The same read-only check asserted that the authorized-key fingerprints are exactly the
+  previously existing login key plus the intended CI key, and that `authorized_keys`
+  retains mode **0600**. No existing key, SSH/sudo/firewall policy, production environment,
+  database, running app or shared service was changed. No private key was uploaded to the
+  server or repository, and no credential value was printed.
+- This resolves the reproduced local CI-key authentication blocker. GitHub's stored secret
+  cannot be read back to prove it matches this private key; a future authorized hosted run
+  must establish CI access and deployment success. No run was retried, no switch was changed,
+  no deployment occurred and no source was committed/pushed. Phase 3 remains blocked by
+  stock-release approval and its remaining actual configuration/rollout acceptance criteria.
+
+#### Hosted Attempt 4: Database Compatibility Refusal (2026-11-27)
+
+- Owner reported another failure. Fresh authenticated inventory shows run
+  [45985720065, attempt 4](https://github.com/Afanyi/HighLowDb/actions/runs/45985720065/attempts/4)
+  for `651717afc16869721d318d47175c4f5a15392fd9`: verification succeeded; deployment job
+  `140474408119` failed in the updater for candidate `402914c2fef64d3f`.
+- SSH is now working: read-only server inspection found a new stage for this exact candidate,
+  its built image and a consistent backup created at `20261127T112242-207d76b2`. The candidate
+  reached server-side building/testing and snapshot creation. The earlier missing-key blocker
+  does not explain this attempt.
+- Reproduced the staged candidate's existing `deploy/data.py check` against that backup in
+  a network-disabled, read-only container with a temporary writable `/tmp` and read-only
+  helper/backup mounts. No production environment was supplied and the live data volume was
+  not mounted. Exit **1**, exact safe error:
+  `ValueError: Database schema/count change requires a reviewed migration`.
+- That check copies backup databases to temporary storage, initializes them with candidate
+  code and compares schema and table counts before/after. The mismatch correctly stops the
+  updater before cutover; passing dummy-data CI tests alone does not approve live-data changes.
+  No exact changed table/column is claimed from the generic error alone.
+- Current installed release remains `c9bad96e9fd67e20`; its app container was healthy with
+  four days' uptime, confirming it was not replaced by this attempted cutover. The reproduced
+  check made no live database, environment, application, host policy or shared-service change.
+- Phase 3 is blocked by the stock plan's reviewed migration/release approval, now confirmed
+  by the real compatibility gate. Follow that plan's dependencies and approval process;
+  never disable the schema/count check, recreate live data or retry a deployment as a substitute.
+  No deployment was rerun and no source was committed or pushed during this diagnosis.
+
+#### Owner Request to Complete Phase 3: Prerequisite Check (2026-11-27)
+
+- Owner requested completion of CI/CD Phase 3 after the compatibility refusal. Rechecked
+  the complete phase, current plan constraints and the stock release requirements. The
+  dependency on reviewed CI/CD Phase 2 is satisfied. Latest hosted main history remains
+  run `45985720065`, attempt **4**, failed; no newer successful rollout resolves the blocker.
+- Stock Phase 2 is still `In Progress`, stock Phase 3 `Blocked`, stock Phases 4/5
+  `Not Started`. Stock Phase 5 depends on Phase 4 and requires a concrete rebuild report,
+  explicit owner approval of that report and migration/rollback rehearsal before live data
+  changes. A request to complete CI/CD does not supply that missing report or satisfy those
+  dependencies; no data approval or acceptance-criterion waiver is inferred from it.
+- Completing stock implementation, selection, independent validation and the reviewed data
+  release is outside this CI/CD phase's explicit application/data non-goals. Under the
+  planning-phases scope rule, leave CI/CD Phase 3 `Blocked` rather than bypass the database
+  check, run an unapproved migration, skip stock dependencies or mark the failed rollout
+  passed. The owner must explicitly switch work to the stock prerequisites, beginning with
+  the unfinished Phase 2, before returning to this phase's monitored rollout.
+- This check changed only plan evidence. No configuration, production data, application,
+  deployment switch, secret, workflow run, commit or push was changed. No new test was
+  needed for the documentation-only update; existing failure evidence remains applicable.
+
+#### Stock Prerequisite Update (2026-11-27)
+
+- The owner explicitly switched work to stock Phase 2. Its rework and same-session review
+  are now **Done — Passed Review** in `docs/PLAN_stock_db.md`, with **265 offline application
+  tests** and **39 CI/deployment regression tests** passing. This supersedes only the earlier
+  inventory's statement that stock Phase 2 is unfinished; the fixes are local and unpushed.
+- Stock Phase 3 still needs its remaining home-listing/UK OHLC investigation and fresh
+  selection verification; Phases 4/5 and approved migration/release remain unfinished.
+  CI/CD Phase 3 stays blocked. No approval was inferred, no workflow gate was weakened and
+  no deployment or hosted rerun occurred. See the stock plan for the documented local
+  refresh-metadata test side effect and its handling. Neither plan is ready for archival.

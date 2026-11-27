@@ -76,6 +76,20 @@ class TestRefresh(unittest.TestCase):
         self.assertNotIn("secret", "\n".join(logs.output))
         self.assertNotIn("not-a-timestamp", "\n".join(logs.output))
 
+    def test_invalid_prices_remain_partial_and_visible_after_dashboard_restart(self):
+        success = self.run_stock()["last_success_at"]
+        self.now += timedelta(days=8)
+        status = self.run_stock({"ok": 1, "invalid": 2, "failed": 0})
+        self.assertEqual(status["summary"], {"ok": 1, "invalid": 2, "failed": 0})
+        self.assertEqual(status["state"], "partial")
+        self.assertEqual(status["last_success_at"], success)
+        self.assertTrue(status["stale"])
+        self.assertEqual(app.last_summary["invalid"], 2)
+        with patch.object(app, "last_summary", None):
+            response = app.app.test_client().get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"2 invalid", response.data)
+
     def test_never_run_and_empty_result_are_not_success(self):
         status = refresh.status(self.db, "stocks", self.now)
         self.assertEqual(status["state"], "never")
@@ -379,6 +393,11 @@ with refresh.job_guard(sys.argv[1], 'stocks') as admitted:
         # Crypto state is independent; check it uses its own schedule.
         status = refresh.status(self.db, "crypto", self.now)
         self.assertEqual(status["schedule"], "Daily at 02:00 UTC")
+        completed = self.now.replace(hour=2, minute=1)
+        refresh.started(self.db, "crypto", "scheduled", completed)
+        refresh.finished(self.db, "crypto", {"coins": 5, "failed": 0}, None, completed)
+        self.assertFalse(refresh.status(self.db, "crypto", completed + timedelta(minutes=1))["stale"])
+        self.assertTrue(refresh.status(self.db, "crypto", completed + timedelta(days=1))["stale"])
 
 
 if __name__ == "__main__":

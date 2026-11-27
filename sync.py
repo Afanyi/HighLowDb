@@ -131,20 +131,16 @@ def _valid_bar(row) -> bool:
 
 def _ordering_ok(metrics: dict) -> bool:
     """Enforce 0 < all_time_min <= year_min <= current_price <= year_max <= all_time_max."""
-    at_min = metrics.get("all_time_min")
-    at_max = metrics.get("all_time_max")
-    yr_min = metrics.get("year_min")
-    yr_max = metrics.get("year_max")
-    cur = metrics.get("current_price")
-    if at_min is None or at_max is None or cur is None:
+    if any(metrics.get(key) is None for key in ("all_time_min", "current_price", "all_time_max")):
         return False
-    if not (0 < at_min <= at_max and 0 < cur <= at_max):
+    try:
+        values = [float(metrics[key]) for key in
+                  ("all_time_min", "year_min", "current_price", "year_max", "all_time_max")
+                  if metrics.get(key) is not None]
+    except (TypeError, ValueError, OverflowError):
         return False
-    if yr_min is not None and not (at_min <= yr_min <= cur):
-        return False
-    if yr_max is not None and not (cur <= yr_max <= at_max):
-        return False
-    return True
+    return all(_valid_price(value) for value in values) and all(
+        lower <= upper for lower, upper in zip(values, values[1:]))
 
 
 def override_matches(inst: dict) -> bool:
@@ -156,13 +152,21 @@ def override_matches(inst: dict) -> bool:
         isin is None or inst.get("isin") == isin)
 
 
+def _us_short_name(inst: dict) -> str | None:
+    short = inst.get("shortName")
+    if not isinstance(short, str):
+        return None
+    symbol = short.replace(".", "-").replace("/", "-")
+    return symbol if US_SHORT_NAME.fullmatch(symbol) else None
+
+
 def line_symbol(inst: dict) -> tuple[str, str] | None:
     """(Yahoo symbol, exchange) from a Trading 212 line; US lines use the current shortName
     (BRK.B / TAP/A -> BRK-B / TAP-A) and fall back to the ticker when it is missing."""
     mapped = to_yahoo(inst["ticker"])
     if mapped and mapped[1] == "US":
-        short = (inst.get("shortName") or "").replace(".", "-").replace("/", "-")
-        if US_SHORT_NAME.match(short):
+        short = _us_short_name(inst)
+        if short:
             return short, "US"
     return mapped
 
@@ -519,7 +523,7 @@ def _isin_acceptable(sym: str | None, expected: str | None) -> str | None:
     A mapped instrument only accepts a symbol on its expected exchange; an unmapped
     instrument accepts any known suffix.
     """
-    if not sym or not ISIN_SYMBOL_PATTERN.match(sym):
+    if not sym or not ISIN_SYMBOL_PATTERN.fullmatch(sym):
         return None
     exch = _exchange_for_symbol(sym)
     if expected is not None and exch != expected:
@@ -547,9 +551,10 @@ def run_sync(db_path: str = DB_PATH) -> dict:
     Only approved members (the ``universe_members`` table) are synced. With no approved
     members the sync returns at once, without calling Trading 212 or Yahoo.
 
-    A confirmed symbol override is used
-    first; otherwise a saved ISIN match, the symbol from the T212 ticker, or for unmappable
-    tickers an ISIN lookup. A symbol with no data is retried once through the ISIN. An ISIN match
+    A confirmed symbol override is used first. Valid US shortName metadata displaces a
+    conflicting saved symbol; otherwise a compatible saved ISIN match takes precedence over
+    the mapped line symbol. Unmappable tickers use an ISIN lookup. A symbol with no data is
+    retried once through the ISIN. An ISIN match
     is saved only once Yahoo returned prices for it, and a saved match without data is dropped.
 
     Returns a summary dict with counts and timestamps: ok, no_data (Yahoo has no prices for
@@ -606,6 +611,10 @@ def run_sync(db_path: str = DB_PATH) -> dict:
             mapped = line_symbol(inst)
             expected = mapped[1] if mapped else None
             saved_sym = saved.get(ticker)
+            if saved_sym and expected == "US" and _us_short_name(inst) and saved_sym != mapped[0]:
+                # The cached symbol may now identify another company after a rename.
+                conn.execute("DELETE FROM yahoo_symbols WHERE ticker=?", (ticker,))
+                saved_sym = None
             saved_exchange = _isin_acceptable(saved_sym, expected)
             if saved_exchange:
                 work[ticker] = [inst, saved_sym, saved_exchange, "saved", expected, ""]
@@ -639,7 +648,7 @@ def run_sync(db_path: str = DB_PATH) -> dict:
                 try:
                     result = _sync_one(yahoo, conn, cursor, work[ticker], isin_tried, current_year)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("%s failed: %r", work[ticker][1], exc)
+                    log.warning("%s failed (%s)", ticker, type(exc).__name__)
                     errored.append(ticker)
                 else:
                     summary[result] += 1
