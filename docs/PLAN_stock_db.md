@@ -19,7 +19,9 @@ value is better than a wrong value.
 
 - No all-stock coverage, ETFs, warrants or funds in the selected list.
 - No price-history tracking, `daily_bars` table, alerts, charts or trading signals.
-- No automatic stock sync, timer, code deployment or second scheduler.
+- No automatic stock sync, timer or second scheduler. The older blanket ban on automatic
+  code deployment is superseded only by the owner-approved GitHub Actions CI/CD work in
+  `docs/PLAN_ci_cd.md`; local/manual deployment remains supported.
 - No new service, container, database engine, job queue or provider framework.
 - No TradingView data, duplicate provider accounts, key rotation to bypass provider limits,
   proxies or IP rotation. The older blanket key-rotation exclusion is superseded only for the
@@ -29,6 +31,13 @@ value is better than a wrong value.
 
 ## 3. Constraints
 
+- **Owner decision on CI/CD (2026-11-27):** `docs/PLAN_ci_cd.md` may coexist as the sole
+  additional active plan under the `AGENTS.md` exception. **Latest owner clarification:**
+  it governs automatic tests on all branches and PRs, with automatic deployment only from
+  `main` after every required check passes, and preserves local/manual deployment. This supersedes the older
+  manual-only code-deployment restriction, including Phase 6's blanket prohibition. It does
+  not authorize automatic stock refresh, unreviewed migrations or bypassing Phase 5's report,
+  owner approval and reviewed data release. Historical deployment evidence remains unchanged.
 - **Owner decision on Trading 212 access (2026-11-25):** the owner will create a replacement
   **demo API key only for now**, correcting the earlier live-key assumption, because the
   existing IP restrictions cannot be edited. **Latest owner decision:** enable all available
@@ -957,7 +966,8 @@ Existing release, proxy route, persistent volume, crypto scheduler and refresh-s
 - Container and database health are verified, data survives an app-only restart, and Docker restarts
   the app and crypto scheduler after boot.
 - Automatic crypto is preserved and a real scheduled completion is recorded.
-- No automatic stock sync or automatic code-deployment mechanism is active.
+- No automatic stock sync is active. Automatic code deployment is permitted only through
+  the owner-approved GitHub Actions CI/CD plan; the older blanket prohibition is superseded.
 - Existing TradingSupport services stay healthy, with no recreation or restart caused by this app's
   work. The app stays within measured host capacity.
 

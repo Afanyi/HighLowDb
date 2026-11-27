@@ -34,6 +34,33 @@ Tests: `docker compose run --rm app python -m unittest`
 
 **Security:** the app is bound to `127.0.0.1` only and requires a form token for manual syncs. Do not expose port 8000 publicly without an authenticated HTTPS reverse proxy.
 
+## Automated verification
+
+GitHub Actions runs the **Application and deployment checks** job on pushes to every branch
+(including names such as `feature/example`) and on pull requests targeting any branch.
+Tag pushes are excluded. Every check is required: a failure stops verification and fails the job.
+Testing does not depend on `ENABLE_AUTO_DEPLOY` or any deployment secret.
+
+Run the same checks locally from the repository root:
+
+```sh
+bash tests/check_ci.sh
+```
+
+Requires Linux, Bash, Python 3.11+ and Docker with Compose >= 2.24 and support for
+`config --no-env-resolution`. The script uses the local Unix Docker socket, downloads test
+images and builds the existing app image as `allstocksdatabase-app:latest`.
+It runs CI runner regression tests, offline application unittests, host deployment tests,
+an isolated Docker setup/update/rollback/recovery drill, HTTPS/login/CSRF smoke checks and a
+packaged-release dry run.
+The host-side checks use only Python's standard library; application dependencies stay in Docker.
+
+Tests use dummy credentials and disposable databases. They need no `.env`, SSH key or production
+access. The drills remove only their own temporary resources; test images/build cache and the
+private release dry-run directory may remain for inspection. Local development and manual server
+deployment commands remain available. This workflow currently performs verification only;
+automatic deployment is added in CI/CD Phase 2 and enabled after Phase 3 validation.
+
 ## Server deployment preparation
 
 The [deployment plan](docs/done/PLAN_deployment.md) targets the existing TradingSupport
