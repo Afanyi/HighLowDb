@@ -59,7 +59,11 @@ Tests use dummy credentials and disposable databases. They need no `.env`, SSH k
 access. The drills remove only their own temporary resources; test images/build cache and the
 private release dry-run directory may remain for inspection. Local development and manual server
 deployment commands remain available. Automatic deployment is disabled unless the repository
-variable `ENABLE_AUTO_DEPLOY` is exactly `true`; leave it `false` until CI/CD Phase 3 validation.
+variable `ENABLE_AUTO_DEPLOY` is exactly `true` (enabled since 2026-11-27). Set it to `false`
+to stop automatic deployments on push; tests keep running. To deploy by hand, open
+Actions → CI/CD → **Run workflow** and choose `main`: it verifies, then deploys, even when the
+switch is `false`. On any other branch the button only runs the checks. Branch `main` requires the passing
+**Application and deployment checks** status check.
 Only a `main` push whose verification succeeds can enter the `production` deployment job.
 The job rejects superseded commits, serializes automatic updates and runs the existing updater
 with temporary SSH credentials. Application/provider secrets stay in the server's private `.env`.

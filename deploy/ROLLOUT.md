@@ -184,21 +184,24 @@ tags/build cache may remain for inspection.
 ## GitHub Actions deployment
 
 The workflow runs verification on every branch push and PR. Its deployment job needs a successful
-verification of the same event commit, a `push` to `refs/heads/main` and repository variable
-`ENABLE_AUTO_DEPLOY` equal to `true`. An unset/false switch disables deployment without affecting
-tests. Keep it `false` during CI/CD Phase 2; activation and production validation belong to Phase 3.
+verification of the same event commit on `refs/heads/main`, and either a `push` with repository
+variable `ENABLE_AUTO_DEPLOY` equal to `true`, or a manual **Run workflow** (`workflow_dispatch`)
+started on `main`. The manual button deploys regardless of the switch; on other branches it
+only verifies. Only users with write access can start it. An unset/false switch disables deployment without affecting
+tests. It is `true` since the first successful automatic deployment on 2026-11-27.
 
 Configure these settings privately in GitHub; they are not files to commit:
 
 | Setting | Location | Value |
 | --- | --- | --- |
-| `ENABLE_AUTO_DEPLOY` | Repository Actions variable | `false` until Phase 3 validation; `true` enables eligible future jobs |
+| `ENABLE_AUTO_DEPLOY` | Repository Actions variable | `true` deploys eligible `main` pushes (current); `false` disables automatic deploys, the manual button still works |
 | `DEPLOY_HOST` | `production` environment variable | Reachable server DNS name or IPv4 address, without user/port; SSH user is `ubuntu` |
 | `DEPLOY_KNOWN_HOSTS` | `production` environment variable | Complete verified host-key entries matching `DEPLOY_HOST`; hashed entries work |
 | `DEPLOY_SSH_KEY` | `production` environment secret | Complete dedicated, unencrypted SSH private key; its public key must already be authorized for `ubuntu` |
 
-Restrict the `production` environment to branch `main` where supported. Environment/protection
-availability and actual server reachability must be verified before activation. The built-in
+The `production` environment allows only branch `main`. Branch protection on `main` requires the
+**Application and deployment checks** status check and blocks force pushes and deletion; admins
+may bypass it for emergencies. The built-in
 read-only GitHub token checks `main`; no additional personal access token or provider API key is
 needed in GitHub. Keep the real application `.env` on the server. CI never calls first setup,
 passes `--env`, replaces provider credentials or bypasses migration/report approval requirements.
@@ -230,7 +233,10 @@ remain failures; the workflow never retries automatically or reports them as suc
 updater-stage failure, inspect the server state and use the existing local update/recovery
 procedure; raw server/Docker output is deliberately excluded from shared Actions logs.
 
-Setting `ENABLE_AUTO_DEPLOY=false` prevents future automatic jobs; it does not cancel a running
-update. `bash deploy/update.sh`, `--dry-run` and explicit recovery remain independent of GitHub,
+Setting `ENABLE_AUTO_DEPLOY=false` prevents future automatic push deploys (`gh variable set
+ENABLE_AUTO_DEPLOY --body false`); the deployment job is then skipped. A manual **Run workflow**
+on `main` still deploys. It does not cancel a
+running update. To recover manually, inspect the server, then run `bash deploy/update.sh` or
+the explicit recovery command described above. `bash deploy/update.sh`, `--dry-run` and explicit recovery remain independent of GitHub,
 its token and enablement switch. Local production updates still run mandatory packaged-source
 and server-candidate tests before cutover. Local development Compose usage is unchanged.

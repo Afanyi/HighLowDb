@@ -950,7 +950,7 @@ Phase 3 work; no Phase 3 finding is marked passed or waived by Phase 2's tests.
 
 ### Phase 3a: Quick placeholder universe and first release
 
-**Status:** Partial — `quick` command and tests done; Remaining: owner push/merge to `main`, CI deploy, server `quick` + `approve`
+**Status:** Blocked — server Trading 212 credentials outdated (401); deploy done, `quick` + `approve` pending
 **Depends on:** Phase 2, Phase 4b
 
 #### Owner Decision (2026-11-27) — supersedes earlier ordering for the first run
@@ -1015,6 +1015,21 @@ Review CSV private (0600/0700); T212 key stays in the server environment; no new
 - `bash tests/check_ci.sh` exit 0: app suite **267 OK**, deploy suite **37 OK**, Docker deploy
   and production checks, dry run. `git diff --check` clean.
 - Nothing pushed, deployed or approved yet.
+
+#### Release and Approve Attempt (2026-11-27)
+
+- Owner merged PR #7; `main` run [46003591075](https://github.com/Afanyi/HighLowDb/actions/runs/46003591075)
+  for `3e013e5` passed verification and deployed release `b077e98f1619bc13` (backup
+  `20261127T130530-f9d2b2dc`). Container healthy; `stocks` 9,695 rows, 0 priced, 0 members.
+- `universe_select.py quick` in the production container failed: Trading 212 demo
+  `/equity/metadata/instruments` returned **401 Unauthorized**. No review file was written and
+  no membership changed. `T212_ENVIRONMENT=demo`; key and secret are set, but their SHA-256
+  prefixes differ from the working local pair (values not printed): the server still holds the
+  old credentials, not the 2026-11-25 replacement demo key. Server IP `92.5.106.5` must also
+  be allowed on that key.
+- **Blocked — server Trading 212 credentials outdated.** Owner must put the replacement demo
+  key/secret into the server environment (e.g. `deploy/update.sh --env <private file>`), then
+  rerun `quick` + `approve`.
 
 ### Phase 4: Add independent validation
 

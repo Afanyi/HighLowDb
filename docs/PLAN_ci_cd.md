@@ -536,7 +536,7 @@ but remains `Not Started`; the plan remains active because that phase is unfinis
 
 ### Phase 3: Validate and enable production deployment; finish operator docs
 
-**Status:** Blocked — candidate database compatibility requires reviewed stock migration/release approval; remaining hosted rollout checks pending
+**Status:** Done — Passed Review (owner-directed completion; switch-off demonstration owner-waived)
 **Depends on:** Phase 2
 
 #### Goal
@@ -864,3 +864,112 @@ No Phase 3 acceptance criterion is marked passed. The phase and plan remain unfi
   application/data changes are a non-goal of this plan. Stock Phase 5 now depends on it.
 - Production deployment still waits for stock Phase 5 approval: the new app shows stock
   `current_price`, which would be empty on live data. CI/CD Phase 3 stays blocked.
+
+
+#### First Successful main Deployment (2026-11-27)
+
+- Owner decision (stock plan Phase 3a): the first release ships with blank stock prices before
+  stock Phase 5. This **supersedes** section 3's and step 2's "activation waits for stock
+  Phase 5 approval" for this first release only; later data changes still follow Phase 5.
+- Run [46003591075](https://github.com/Afanyi/HighLowDb/actions/runs/46003591075), `main`
+  `3e013e5`: verification passed, then deployment **succeeded** for release
+  `b077e98f1619bc13`; `current.json` matches; app container healthy; backup
+  `20261127T130530-f9d2b2dc` exists. Criterion "real authorized main update" — **met**.
+- Recorded hosted evidence: non-main `dev` push/PR runs (e.g. 46003191521, 46003324519)
+  verified with deployment skipped; failed `dev` verification 45981224379 skipped deployment;
+  the isolated failed-cutover drill runs inside verification.
+- **Still open:** `main` has no branch protection (API 404; `production` environment allows
+  only `main`); switch-off run with `ENABLE_AUTO_DEPLOY=false` not yet demonstrated; local
+  recovery rehearsal not recorded for this phase; README/ROLLOUT still say "leave `false`
+  until Phase 3 validation". Phase 3 stays `In Progress` until these have evidence.
+
+#### Completion Items 1, 3, 4 (2026-11-27)
+
+- **Branch protection (owner-authorized):** `main` now requires status check
+  **Application and deployment checks** (GitHub Actions app), blocks force pushes and deletion;
+  `enforce_admins` off so the owner can bypass in emergencies. `production` environment
+  allows only `main`. Verified via the protection API response.
+- **Local fallback:** `bash deploy/update.sh --dry-run` without GitHub tokens completed
+  ("no SSH, environment file read/upload, or deployment"); `python3 tests/check_deploy_docker.py`
+  passed install/update, blocked cutover, unhealthy-cutover rollback, explicit recovery and
+  unrelated-container isolation drills. Independent of `ENABLE_AUTO_DEPLOY`.
+- **Docs:** `README.md` and `deploy/ROLLOUT.md` now describe the enabled switch, how to
+  disable it, branch protection and manual recovery.
+- **Remaining:** switch-off demonstration (item 2) needs a commit pushed and merged to `main`
+  while `ENABLE_AUTO_DEPLOY=false`. The agent's commit/push was refused by the permission
+  classifier (public repository; plan files contain production details). Owner action needed.
+
+#### Owner-Directed Completion (2026-11-27)
+
+- Owner instruction: "marks phase 3 as done and complete". Every criterion except one has
+  recorded evidence above (successful `main` deployment, backup/release/health, non-main and
+  failed-verification runs skipping deployment, isolated rollback drill, local fallback,
+  operator docs, branch/environment protection).
+- **Owner-waived:** the hosted demonstration that `ENABLE_AUTO_DEPLOY=false` prevents a `main`
+  push deployment was **not** run (agent commit/push to the public repository was refused).
+  The behavior is covered by `tests/check_deploy.py` (switch `false`/empty → no credentials,
+  build or update) and the workflow condition, but has no hosted evidence.
+- Phase 3 set to `Done — Passed Review` on that basis. Unrelated: stock plan Phase 3a remains
+  blocked on outdated server Trading 212 credentials.
+
+### Phase 4: Manual "Run workflow" deployment button on `main`
+
+**Status:** Partial — implemented and locally verified; Remaining: owner commit/merge to `main` and one hosted **Run workflow** on `main`
+**Depends on:** Phase 3
+
+#### Owner Decision (2026-11-27)
+
+The owner wants a button on `main` that deploys when clicked, and it must work **even when
+`ENABLE_AUTO_DEPLOY` is `false`**. This supersedes the earlier rule that every deployment
+requires the switch: the switch now gates only automatic deploys on `push`; a manual
+`workflow_dispatch` on `main` is the owner's explicit release action. All other gates stay.
+
+#### Scope
+
+`.github/workflows/ci-cd.yml` (add `workflow_dispatch`, extend the deploy condition),
+`deploy/ci.py` `eligible()`, `tests/check_deploy.py`, README/ROLLOUT text.
+
+#### Do Not Change
+
+Verification job contents, stale-`main` check, SSH trust validation, updater gates,
+concurrency group, environment restriction to `main`.
+
+#### Steps
+
+1. Add `workflow_dispatch:` to `on:`; deploy job runs for `push` with switch `true`, or for
+   `workflow_dispatch`, both only on `refs/heads/main` after verification success.
+2. `eligible()`: accept `workflow_dispatch` on `main` without the switch; `push` still needs it.
+3. Tests: dispatch on `main` with switch off deploys; dispatch on other refs, failed
+   verification, other repo, or pull_request never deploy; push with switch off still refused.
+4. Docs: how to use the button and what the switch now controls.
+
+#### Acceptance Criteria
+
+- Actions shows **Run workflow** for CI/CD; running it on `main` runs verification, then
+  deployment, regardless of the switch (hosted evidence after merge).
+- Running it on another branch runs verification only; deployment is skipped/refused.
+- A `push` to `main` with the switch off still does not deploy.
+- `bash tests/check_ci.sh` passes.
+
+#### Verification
+
+Deploy test suite, full `tests/check_ci.sh`, YAML parse; hosted run after owner merge.
+
+#### Security Check
+
+Only users with write access can dispatch; `production` environment remains `main`-only;
+no new secret or input parameter; stale/dirty checkout checks unchanged.
+
+#### Execution Evidence (2026-11-27)
+
+- `.github/workflows/ci-cd.yml`: `workflow_dispatch` added; deploy `if` is now
+  `main` ref AND verify success AND (`workflow_dispatch` OR (`push` AND switch `true`)).
+- `deploy/ci.py` `eligible()`: same rule; ref, repository and verification gates unchanged.
+- `tests/check_deploy.py`: manual run on `main` with switch `false` deploys; manual run on
+  `dev`, a `main` tag, a fork, or with failed/missing verification never builds, calls the API
+  or materializes credentials; `push` with switch `false`/empty still refused (existing test,
+  `workflow_dispatch` replaced by `schedule` there as an ineligible event).
+- Docs: README and `deploy/ROLLOUT.md` describe the button and the switch's narrower meaning.
+- `python3 -m unittest tests.check_deploy -q` **39 OK**; `bash tests/check_ci.sh` exit 0
+  (267 app tests, 39 deploy tests, Docker drills, dry run); workflow YAML parses;
+  `git diff --check` clean. Hosted criteria pending the owner's merge; nothing pushed.
