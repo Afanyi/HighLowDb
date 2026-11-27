@@ -136,6 +136,12 @@ and non-US coverage; how yfinance's split-adjusted values behave for serial reve
    call Yahoo.
 3. **Manual validation:** compare a rotating sample with independent providers.
 
+**Current US symbol mapping:** identity-checked Phase 1 overrides take precedence; otherwise
+use valid normalized Trading 212 `shortName` for US lines. Discard a conflicting saved Yahoo
+symbol instead of pricing a possibly different company. Compatible caches and non-US
+exchange validation retain their existing behavior; missing/invalid short names fall back to
+the existing mapping/ISIN path. This supersedes the old US ticker-only mapping.
+
 At 0.5 s pacing a member sync is estimated at about 16 minutes (measured 0.93 s per stock). Selection is the larger Yahoo job because
 it needs 63 sessions for each eligible candidate.
 
@@ -465,7 +471,7 @@ private metadata/sample artifacts. No blocking findings or credible security iss
 
 ### Phase 2: Correct the five stored values
 
-**Status:** In Progress — owner-approved amendment (2026-11-26): US Yahoo symbols from Trading 212 `shortName`
+**Status:** Done — Passed Review
 **Depends on:** Phase 1
 
 #### Goal
@@ -485,6 +491,36 @@ Universe selection, crypto behavior, deployment or live data.
 #### Reuse First
 
 `compute_metrics`, `_Yahoo`, `_upsert`, `init_db`, `yahoo_symbols` and existing tests.
+
+#### Current Owner Decision and Rework Scope (2026-11-27)
+
+The owner explicitly requested completing and fixing stock Phase 2 before returning to CI/CD.
+Phase 1 is `Done — Passed Review`. The 2026-11-26 amendment to use valid US Trading 212
+`shortName` supersedes the earlier final review's completion status for the reopened mapping
+work. Confirmed name/ISIN overrides remain first; a valid normalized US `shortName` must take
+precedence over a conflicting saved symbol. Discard that conflicting cache entry. Reuse a saved
+ISIN match when it agrees with current US metadata or when no valid US short name is available;
+non-US exchange validation and fallback behavior remain unchanged. This clarifies Phase 5's
+saved-match reuse criterion: a cache conflicting with current authoritative metadata is invalid.
+
+Rechecked the whole plan's goals, constraints, strategy, dependencies and acceptance criteria.
+Keep approved-member-only sync already introduced by Phase 3, all fixed overrides and no live
+data/selection/deployment changes. Phase 3's older requirement to obtain an owner decision on
+US `shortName` is superseded by the amendment and this rework; its other acceptance blockers
+and unfinished status remain. No later stock phase is executed by this request.
+
+Inspection also found raw provider exception logging in `run_sync`, contrary to the plan's
+secret-free logging requirement and prior review evidence. Treat it as an in-scope security
+blocker until a regression proves that only the exception type is logged. No real exposed
+secret has been identified. Other confirmed gaps to repair after that blocker is resolved:
+incomplete fallback price ordering/finite checks and loss of invalid-price counts in refresh
+metadata/dashboard summaries. Existing public-key and CI/CD plan edits are preserved.
+
+The failing-request regression reproduced raw synthetic provider-token text in log output.
+Changed that in-scope handler to log the Trading 212 ticker and exception type only. The same
+regression now passes while retaining its good-value preservation, legacy clearing and failure
+flags. This resolves the security blocker before other Phase 2 rework resumes; no real secret
+exposure or production change is claimed.
 
 #### Steps
 
@@ -507,6 +543,11 @@ Universe selection, crypto behavior, deployment or live data.
 - Stock staleness no longer depends on a weekday schedule. Crypto status is unchanged.
 - Year values use the calendar year; float64 values are preserved.
 - No price history is written to the database.
+- Valid normalized US `shortName` wins over a conflicting saved Yahoo symbol; matching caches,
+  absent/invalid-metadata fallback, non-US mappings and fixed identity-checked overrides work.
+- Invalid-price counts survive refresh persistence and dashboard restart; a stock run with
+  invalid prices is partial and does not replace its last successful refresh timestamp.
+- Stock sync logs retain exception type for diagnostics without raw provider exception text.
 
 #### Verification
 
@@ -655,9 +696,86 @@ only the ticker, no provider text stored; no issue found. Optional, not blocking
 staleness test checks only the schedule label; the stock status still shows a weekday schedule
 (Phase 0 area); `current_year` uses server-local time.
 
+#### Owner-Requested Phase 2 Completion: Execution Evidence (2026-11-27)
+
+- Reopened only Phase 2 under the owner's latest request; Phase 1 dependency is satisfied.
+  Preserved the existing CI/CD plan changes and production deployment blocker. The security
+  regression first demonstrated raw synthetic provider-token text in logs, then passed after
+  logging was limited to ticker/exception type. No actual exposed credential was identified.
+- Added failing regressions before functional fixes: a saved `WWE` displaced current `TKO`;
+  non-string short names crashed sync; a trailing newline bypassed symbol validation;
+  missing-year and infinite legacy prices passed fallback validation; invalid-price counts
+  disappeared from persistent refresh summaries. These failures were observed, not inferred.
+- Reused `line_symbol`, saved-symbol handling, `_ordering_ok`, refresh counts and the existing
+  dashboard. Added one small shared short-name normalizer; no dependency, database column,
+  runtime module, alternative sync loop or deployment mechanism was introduced.
+- Valid US metadata invalidates a conflicting cached symbol before prices are requested.
+  Matching/absent-metadata caches, class-share normalization, non-US mapping, fixed overrides,
+  approved-member filtering and ISIN exchange validation remain covered by regressions.
+- Fallback validation now checks finite positive prices across the complete ordering chain,
+  including when year extrema are absent. Invalid existing values are cleared; last good
+  values and fixed failure flags are retained as appropriate. ISIN symbols require a full
+  pattern match, including rejection of trailing newlines.
+- Persist `invalid` counts; stock runs with invalid prices stay partial and retain their
+  previous successful refresh timestamp. The dashboard shows invalid counts after in-memory
+  summaries are lost. Added an actual crypto stale-value check across its next daily slot;
+  crypto retains its existing schedule and freshness behavior.
+- **Final verification passed:** built `allstocksdatabase-phase2-review:latest`, image
+  `sha256:10011c73dda2f303b336eb8b6beaca107375aebb2b63cf1894d7447b753089f9`, and ran the
+  complete **265-test** unittest suite as UID 10001 with `--network none`, `--read-only`,
+  writable tmpfs `/tmp`, 512 MiB, 0.5 CPU, no host mounts, dummy provider keys and both DB
+  paths under `/tmp`. The earlier 264-test run also passed before the final ISIN regression
+  and explicit test-connection cleanup were added. **39 CI/deployment tests** also passed.
+  `git diff --check` passed. No real selection, provider refresh or production rollout is
+  represented by these fixture results.
+- **Local test side effect:** one early targeted host command imported `app` and started its
+  existing crypto scheduler with a dummy key before verification was moved into offline
+  containers. It updated the existing local crypto refresh-state record; `crypto.db` retained
+  its prior modification time. Used `refresh.status` to mark that abandoned attempt interrupted,
+  asserting the prior success timestamp was preserved. Did not delete or invent a replacement
+  for the existing metadata file. All final app verification was isolated; no server or live
+  deployment was accessed during this Phase 2 task.
+- No live migration, membership approval, production environment/configuration, stock sync,
+  commit or push occurred. Later stock phases and CI/CD activation remain unfinished. Set
+  Phase 2 `Ready for Review`; the plan stays active and is not archived.
+
+#### Completion Review (2026-11-27)
+
+**Done — Passed Review.** Switched from execution to review after recording `Ready for Review`.
+Read the actual runtime/test diff, complete phase and all active-plan acceptance criteria;
+checked security, correctness, scope, reuse and verification. The small shared normalizer and
+existing fallback/refresh paths avoid duplicated sync logic, new dependencies and schema changes.
+No blocking correctness or credible security issue remains in this phase's implementation.
+
+| Current acceptance criterion | Verified evidence | Result |
+| --- | --- | --- |
+| Split-only extrema avoid dividend-adjusted negative/non-traded lows | `_Yahoo.history` requests `auto_adjust=False`; synthetic adjusted/split provider regression frames and impossible-bar tests | Passed |
+| XEB.F, TBT.F, ROST, LOBO and confirmed overrides | Full sync fixture tests, all seven exact-name/ISIN override cases, mismatched-identity refusal and stock cell-order/filter tests | Passed |
+| Failed/empty responses preserve good values and flag rows | Existing no-data, invalid-result and exhausted-retry regressions; good values retained and rows flagged | Passed |
+| Invalid legacy values never count as good fallback data | Existing clearing tests plus non-finite, missing-year range and malformed-value regressions | Passed |
+| Seven-day stock freshness; crypto unchanged | Stock age tests plus crypto stale-value assertions before/after its next daily slot; full crypto suite | Passed |
+| Calendar-year values and float64 preserved | Calendar-year filtering, exchange-time unfinished-session exclusion, float64/LOBO fixture regressions | Passed |
+| No stored price history | Runtime write paths retain aggregate stock values, symbol cache, pre-existing membership and refresh metadata; no history table/write path added | Passed: code inspection |
+| Current US metadata precedes conflicting caches | Renamed ticker, share-class, conflicting/matching cache, missing/invalid metadata, fixed override and non-US regressions | Passed |
+| Invalid counts persist, render and retain prior success | Eight-day stale/partial refresh and dashboard-restart regression; `invalid=2` is preserved and displayed | Passed |
+| Safe provider failure diagnostics | Initially failing synthetic-secret regression now proves exception type retained and raw exception text excluded | Passed |
+
+Verification applies to the final unchanged code/test image recorded above: **265 isolated
+application tests**, **39 CI/deployment regressions**, Python AST parsing and `git diff --check`
+passed. No additional expensive test repeat was needed after documentation-only review changes.
+No criterion was waived. The local refresh-metadata side effect and its handling are explicitly
+recorded above; no production operation or provider-backed data result is claimed.
+
+Limit: this is a same-session review, not an independent external review. Prior optional
+observations about the unused stock weekday status fields and server-local `current_year`
+remain outside this rework; the previously weak crypto staleness assertion was strengthened.
+No later stock phase was executed. Phase 3's dependency is now satisfied, but its remaining
+home-listing/UK OHLC findings and fresh selection verification are still unresolved. Phases 4/5
+and CI/CD's production approval/rollout remain unfinished; both active plans stay in place.
+
 ### Phase 3: Select the 1,000-stock universe
 
-**Status:** Blocked — owner decision needed: stale Trading 212 tickers break symbol mapping in Phase 2 sync and Phase 3 selection
+**Status:** Blocked — remaining home-listing/UK OHLC findings and fresh selection verification need resolution
 **Depends on:** Phase 2
 
 #### Goal
@@ -825,6 +943,11 @@ error 377 (Yahoo HTTPError, retryable with `--resume`); invalid OHLC 234; others
 Changing symbol mapping touches Phase 2 (Done — Passed Review), so the owner must decide the
 fix before Phase 3 continues.
 
+**Superseded mapping-decision blocker (2026-11-27):** the owner approved US `shortName`
+mapping on 2026-11-26 and has now requested its Phase 2 completion/re-review. The shared mapping
+repair belongs there. Findings 2/3 above and re-verification of selection after that repair remain
+Phase 3 work; no Phase 3 finding is marked passed or waived by Phase 2's tests.
+
 ### Phase 4: Add independent validation
 
 **Status:** Not Started
@@ -914,7 +1037,9 @@ TradingSupport, crypto data or automatic-sync status.
 - A second manual sync with unchanged provider data changes no stored market values.
 - No automatic stock run occurs.
 - A selected stock whose mapped symbol has no data can recover through a valid ISIN match.
-- A saved ISIN match is reused on the next manual sync without a new ISIN lookup.
+- A saved ISIN match compatible with current US `shortName` metadata and the expected exchange
+  is reused on the next manual sync without a new ISIN lookup. A conflicting cache is invalid
+  under the Phase 2 owner decision and must be discarded.
 - No selected row contains data from a market that conflicts with its Trading 212 listing.
 - ETFs and warrants are not in the selected list.
 - The updated docs describe manual stock sync and the selected universe.

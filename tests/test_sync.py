@@ -1,3 +1,4 @@
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
@@ -499,6 +500,12 @@ class TestIsinFallback(unittest.TestCase):
         self.assertEqual(summary["ok"], 0)
         self.assertEqual(summary["no_data"], 1)
 
+    def test_isin_symbol_with_trailing_newline_is_rejected(self):
+        instruments = [{"ticker": "ABC_US_EQ", "type": "STOCK", "name": "Abc", "isin": "US0000000001"}]
+        summary = self._run(instruments, {"ABC": [self._empty_hist()]}, isin_lookup=lambda isin: "GENI\n")
+        self.assertEqual((summary["ok"], summary["no_data"], summary["resolved_by_isin"]), (0, 1, 0))
+        self.assertEqual(self._saved(), {})
+
     def test_saved_match_is_reused_without_isin_lookup(self):
         sync.init_db(self.db_path)
         conn = sqlite3.connect(self.db_path)
@@ -681,6 +688,16 @@ class TestPhase2Regression(unittest.TestCase):
         m = sync.compute_metrics(hist, 2025)
         self.assertEqual(m["status_tag"], "DELISTED_OR_ZERO")
         self.assertIsNone(m["current_price"])
+
+    def test_ordering_rejects_nonfinite_and_out_of_range_prices_without_year_values(self):
+        valid = {"all_time_min": 10.0, "all_time_max": 30.0, "current_price": 20.0,
+                 "year_min": None, "year_max": None}
+        self.assertTrue(sync._ordering_ok(valid))
+        for change in ({"current_price": 5.0}, {"all_time_max": float("inf")},
+                       {"year_min": float("nan")}, {"year_max": float("inf")},
+                       {"all_time_min": None}, {"current_price": "unusable"}):
+            with self.subTest(change=change):
+                self.assertFalse(sync._ordering_ok(valid | change))
 
     def test_event_only_rows_discarded(self):
         """Rows with all-NaN OHLC are discarded before computing metrics."""
@@ -998,6 +1015,25 @@ class TestLastGoodValueRetention(unittest.TestCase):
             sync.run_sync(db_path=self.db_path)
         self.assertEqual(self._legacy_values(), (None, None, None, None, "STALE", "NO_DATA"))
 
+    def test_no_data_clears_nonfinite_and_out_of_range_stored_values(self):
+        sync.init_db(self.db_path)
+        instruments = [{"ticker": "LOW_US_EQ", "type": "STOCK", "name": "Below its low"},
+                       {"ticker": "INF_US_EQ", "type": "STOCK", "name": "Infinite high"}]
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executemany("INSERT INTO stocks (ticker, current_price, all_time_min, all_time_max) "
+                             "VALUES (?, ?, ?, ?)",
+                             [("LOW_US_EQ", 5.0, 10.0, 30.0), ("INF_US_EQ", 20.0, 10.0, float("inf"))])
+            conn.commit()
+        empty = pd.DataFrame({"Open": [], "High": [], "Low": [], "Close": []}, index=pd.DatetimeIndex([]))
+        with patch("sync.fetch_instruments", return_value=instruments), patch("sync.yf.Ticker") as provider:
+            provider.return_value.history.return_value = empty
+            summary = sync.run_sync(db_path=self.db_path)
+        self.assertEqual(summary["no_data"], 2)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT current_price, all_time_min, all_time_max, status_tag, quality_flags "
+                                "FROM stocks ORDER BY ticker").fetchall()
+        self.assertEqual(rows, [(None, None, None, "STALE", "NO_DATA")] * 2)
+
     def test_invalid_new_values_clear_legacy_invalid_values(self):
         self._legacy_row()
         instruments = [{"ticker": "AAPL_US_EQ", "type": "STOCK", "name": "Apple", "isin": "US0378331005"}]
@@ -1027,9 +1063,12 @@ class TestLastGoodValueRetention(unittest.TestCase):
             {"ticker": "NVDA_US_EQ", "type": "STOCK", "name": "NVIDIA", "isin": "US67066G1040"},
         ]
         with patch("sync.fetch_instruments", return_value=instruments), \
-                patch("sync.yf.Ticker") as mock_ticker:
-            mock_ticker.return_value.history.side_effect = ConnectionError("down")
+                patch("sync.yf.Ticker") as mock_ticker, \
+                self.assertLogs("sync", level="WARNING") as logs:
+            mock_ticker.return_value.history.side_effect = ConnectionError("fixture-private-provider-token")
             summary = sync.run_sync(db_path=self.db_path)
+        self.assertNotIn("fixture-private-provider-token", "\n".join(logs.output))
+        self.assertIn("ConnectionError", "\n".join(logs.output))
         self.assertEqual(summary["failed"], 3)
         conn = sqlite3.connect(self.db_path)
         try:
@@ -1056,9 +1095,12 @@ class TestLastGoodValueRetention(unittest.TestCase):
 
 class TestLineSymbol(unittest.TestCase):
     def test_us_lines_use_current_short_name(self):
-        cases = [("WWE_US_EQ", "TKO", ("TKO", "US")), ("BRK/B_US_EQ", "BRK.B", ("BRK-B", "US")),
+        cases = [("WWE_US_EQ", "TKO", ("TKO", "US")), ("CSWI_US_EQ", "CSW", ("CSW", "US")),
+                 ("SYX_US_EQ", "GIC", ("GIC", "US")), ("FSRV_US_EQ", "KPLT", ("KPLT", "US")),
+                 ("BRK/B_US_EQ", "BRK.B", ("BRK-B", "US")),
                  ("TAP/A_US_EQ", "TAP/A", ("TAP-A", "US")), ("AAPL_US_EQ", None, ("AAPL", "US")),
-                 ("AAPL_US_EQ", "bad name!", ("AAPL", "US")), ("BPl_EQ", "XX", ("BP.L", "LSE")),
+                 ("AAPL_US_EQ", "bad name!", ("AAPL", "US")), ("AAPL_US_EQ", "TKO\n", ("AAPL", "US")),
+                 ("AAPL_US_EQ", 42, ("AAPL", "US")), ("BPl_EQ", "XX", ("BP.L", "LSE")),
                  ("SHOP_CA_EQ", "XX", ("SHOP.TO", "TSX"))]
         for ticker, short, expected in cases:
             self.assertEqual(sync.line_symbol({"ticker": ticker, "shortName": short}), expected, ticker)
@@ -1078,6 +1120,46 @@ class TestLineSymbol(unittest.TestCase):
             summary = sync.run_sync(db_path=tmp.name)
         self.assertEqual([c.args[0] for c in ticker.call_args_list], ["TKO"])
         self.assertEqual(summary["ok"], 1)
+
+    def _sync_cached_symbol(self, short_name, cached):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        db = directory + "/stocks.db"
+        sync.init_db(db)
+        with closing(sqlite3.connect(db)) as conn:
+            conn.execute("INSERT INTO yahoo_symbols VALUES (?, ?, 'fixture')", ("WWE_US_EQ", cached))
+            conn.commit()
+        approve_all_stocks(self)
+        instruments = [{"ticker": "WWE_US_EQ", "shortName": short_name, "type": "STOCK",
+                        "name": "TKO Group Holdings", "isin": "US87256C1018"}]
+        hist = pd.DataFrame({"Open": [10.0] * 10, "High": [11.0] * 10, "Low": [9.0] * 10,
+                             "Close": [10.0] * 10}, index=pd.date_range("2024-01-02", periods=10))
+        with patch("sync.fetch_instruments", return_value=instruments), patch("sync.time.sleep"), \
+                patch("sync.yf.Ticker") as ticker, patch("sync.get_ticker_by_isin") as lookup:
+            ticker.return_value.history.return_value = hist
+            summary = sync.run_sync(db_path=db)
+        lookup.assert_not_called()
+        with closing(sqlite3.connect(db)) as conn:
+            saved = dict(conn.execute("SELECT ticker, yahoo_symbol FROM yahoo_symbols"))
+            self.assertEqual(conn.execute("SELECT current_price FROM stocks").fetchone(), (10.0,))
+        self.assertEqual(summary["ok"], 1)
+        return [c.args[0] for c in ticker.call_args_list], saved
+
+    def test_current_short_name_displaces_conflicting_saved_symbol(self):
+        calls, saved = self._sync_cached_symbol("TKO", "WWE")
+        self.assertEqual(calls, ["TKO"])
+        self.assertEqual(saved, {})
+
+    def test_matching_cached_symbol_is_retained(self):
+        calls, saved = self._sync_cached_symbol("TKO", "TKO")
+        self.assertEqual(calls, ["TKO"])
+        self.assertEqual(saved, {"WWE_US_EQ": "TKO"})
+
+    def test_absent_or_invalid_short_name_preserves_isin_cache(self):
+        for short in (None, "not a symbol", 42):
+            with self.subTest(short=short):
+                calls, saved = self._sync_cached_symbol(short, "TKO")
+                self.assertEqual(calls, ["TKO"])
+                self.assertEqual(saved, {"WWE_US_EQ": "TKO"})
 
 
 class TestApprovedMembersOnly(unittest.TestCase):

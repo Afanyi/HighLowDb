@@ -37,7 +37,7 @@
     {% elif summary and summary.error %}
       <span class="badge text-bg-danger me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">Error: {{ summary.error }}</span>
     {% elif refresh.state == "partial" %}
-      <span class="badge text-bg-warning me-2">Completed with gaps: {{ refresh.summary.failed or 0 }} failed</span>
+      <span class="badge text-bg-warning me-2">Completed with gaps: {{ refresh.summary.failed or 0 }} failed{% if mode != "crypto" %}, {{ refresh.summary.invalid or 0 }} invalid{% endif %}</span>
     {% elif summary %}
       {% if mode == "crypto" %}
         <span class="badge text-bg-success me-2" title="{{ summary.started_at or '—' }} → {{ summary.finished_at or '—' }}">OK: {{ summary.coins }} coins, Backfilled: {{ summary.backfilled }}, Failed: {{ summary.failed }}</span>
