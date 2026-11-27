@@ -501,6 +501,25 @@ class TestSelectAndApprove(unittest.TestCase):
         self.assertEqual(len(members), 31)
         self.assertIn(("TOMd_EQ", "JP3633400001", "JP", 1), members)
 
+    def test_quick_placeholder_needs_no_prices_and_approves(self):
+        with patch("sync._Yahoo", side_effect=AssertionError("no Yahoo")), \
+                patch.object(us, "fetch_ecb_rates", side_effect=AssertionError("no ECB")):
+            summary = us.run_quick(self.out)
+        self.assertEqual(self.members(), [])
+        self.assertEqual(stat.S_IMODE(os.stat(summary["review"]).st_mode), 0o600)
+        rows = [r for r in self.rows(summary["review"]) if r["status"] == "SELECTED"]
+        self.assertEqual(summary["selected"], len(rows))
+        self.assertEqual(len({r["isin"] for r in rows}), 31)   # no ETF, warrant, Cayman or duplicate
+        self.assertEqual(summary["unfilled"]["US"], us.COUNTRY_QUOTAS["US"] - 30)
+        self.assertEqual(us.run_approve(Path(summary["review"]), self.db), 31)
+        self.assertIn(("TOMd_EQ", "JP3633400001", "JP", 1), self.members())
+
+    def test_quick_placeholder_respects_quotas(self):
+        with patch.dict(us.COUNTRY_QUOTAS, {"US": 5}):
+            summary = us.run_quick(self.out)
+            self.assertEqual(us.run_approve(Path(summary["review"]), self.db), 6)
+        self.assertEqual([m[3] for m in self.members() if m[2] == "US"], [1, 2, 3, 4, 5])
+
     def write_review(self, rows):
         path = Path(self.dir.name) / "edited.csv"
         with open(path, "w", newline="", encoding="utf-8") as fh:

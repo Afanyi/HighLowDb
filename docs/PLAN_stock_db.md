@@ -948,6 +948,74 @@ mapping on 2026-11-26 and has now requested its Phase 2 completion/re-review. Th
 repair belongs there. Findings 2/3 above and re-verification of selection after that repair remain
 Phase 3 work; no Phase 3 finding is marked passed or waived by Phase 2's tests.
 
+### Phase 3a: Quick placeholder universe and first release
+
+**Status:** Partial — `quick` command and tests done; Remaining: owner push/merge to `main`, CI deploy, server `quick` + `approve`
+**Depends on:** Phase 2, Phase 4b
+
+#### Owner Decision (2026-11-27) — supersedes earlier ordering for the first run
+
+The owner wants the pipeline functional as soon as possible: "just select 1000 top
+candidates ... keep everything in the db null at first". Decisions:
+- **Selection:** quota fill from one Trading 212 instrument call only (no Yahoo, no price
+  history, minutes not hours). Same country quotas and stock-only/priceable-line rules as
+  `candidate_groups`; stable order (ISIN) within each country; `volatility` 0, `rank` 1..N.
+  It is **not** ranked by volatility. Phase 3's real selection replaces it later through the
+  same `approve` path.
+- **Deploy now:** release with blank stock prices until a sync. This **supersedes** Phase 4b's
+  "tooling only" decision and Phase 5's approval-before-release **for this first release
+  only**; Phase 5's report/approval still governs replacing the placeholder list and deleting rows.
+- **Existing rows:** keep all ~9,695 rows; no deletion and no row-count migration.
+- Not authorized: automatic stock sync, unreviewed migrations, weakening the data check.
+
+#### Scope
+
+A `quick` subcommand in `universe_select.py` that writes the same private review CSV format,
+its tests, approving that CSV on production with the existing `approve` command, and the
+deployment of the current code.
+
+#### Do Not Change
+
+`approve` validation, `sync` mapping, the deploy data check, automatic-sync status, crypto.
+
+#### Reuse First
+
+`candidate_groups`, `COUNTRY_QUOTAS`, `write_review`, `read_selected`/`run_approve`.
+
+#### Steps
+
+1. Add `quick` (writes review CSV; never changes membership) and tests.
+2. Run the local suites. Owner pushes/merges to `main`; CI deploys (auto-deploy on).
+3. On the server, run `quick` then `approve` inside the app container; verify member count.
+
+#### Acceptance Criteria
+
+- `quick` output passes `read_selected` (quotas, ISIN/country, no duplicates, no ETFs) and has
+  at most 1,000 rows; unfilled quotas are reported, not padded.
+- Production runs the new release, is healthy, and `universe_members` holds the approved rows.
+- Stock prices may be blank; no automatic stock sync runs; no stock rows deleted.
+
+#### Verification
+
+`tests/check_deploy.py`, app unit tests, the hosted CI run, read-only SQLite counts after approve.
+
+#### Security Check
+
+Review CSV private (0600/0700); T212 key stays in the server environment; no new web route.
+
+#### Execution Evidence (2026-11-27)
+
+- `universe_select.py`: `run_quick(out_dir, instruments=None)` and the `quick` subcommand reuse
+  `candidate_groups` (stocks only, priceable line, ISIN in a quota country, one row per ISIN),
+  fill each `COUNTRY_QUOTAS` entry in ISIN order with the alphabetically first line, and write
+  the existing private review files via `write_review` (`reason` `quick_placeholder`,
+  `volatility` 0). Unfilled quotas are reported, never padded. No Yahoo or ECB call.
+- Tests (`tests/test_universe_select.py`): no Yahoo/ECB used, membership unchanged until
+  approve, file 0600, ETF/warrant/Cayman/duplicate excluded, approve loads it, quota capping.
+- `bash tests/check_ci.sh` exit 0: app suite **267 OK**, deploy suite **37 OK**, Docker deploy
+  and production checks, dry run. `git diff --check` clean.
+- Nothing pushed, deployed or approved yet.
+
 ### Phase 4: Add independent validation
 
 **Status:** Not Started
