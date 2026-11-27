@@ -544,8 +544,28 @@ class TestCiDeployment(unittest.TestCase):
         self.assertIn("**succeeded**", (self.tmp / "summary").read_text())
         self.assertEqual(len([c for c in self.commands if c[0] == "bash"]), 1)
 
+    def test_manual_run_on_main_deploys_even_with_switch_off(self):
+        self.env.update(GITHUB_EVENT_NAME="workflow_dispatch", ENABLE_AUTO_DEPLOY="false")
+        code, output, _ = self.run_ci()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len([c for c in self.commands if c[0] == "bash"]), 1)
+
+    def test_manual_run_keeps_branch_repository_and_verification_gates(self):
+        self.env.update(GITHUB_EVENT_NAME="workflow_dispatch", ENABLE_AUTO_DEPLOY="")
+        for name, value in (("GITHUB_REF", "refs/heads/dev"), ("GITHUB_REF", "refs/tags/main"),
+                            ("GITHUB_REPOSITORY", "other/fork"), ("CI_VERIFY_RESULT", "failure"),
+                            ("CI_VERIFY_RESULT", "")):
+            with self.subTest(name=name, value=value):
+                original = self.env[name]
+                self.env[name] = value
+                try:
+                    code, _, api_calls = self.run_ci()
+                    self.assertEqual((code, api_calls, self.commands), (1, 0, []))
+                finally:
+                    self.env[name] = original
+
     def test_ineligible_runs_never_prepare_credentials_build_or_update(self):
-        for name, value in (("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+        for name, value in (("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "schedule"),
                             ("GITHUB_REF", "refs/heads/dev"), ("GITHUB_REF", "refs/heads/feature/example"),
                             ("GITHUB_REF", "refs/tags/main"), ("GITHUB_REPOSITORY", "other/fork"),
                             ("ENABLE_AUTO_DEPLOY", "false"), ("ENABLE_AUTO_DEPLOY", ""),

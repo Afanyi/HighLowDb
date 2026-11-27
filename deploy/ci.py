@@ -18,10 +18,11 @@ SHA = re.compile(r"[a-f0-9]{40}")
 
 
 def eligible(environ):
-    return (environ.get("GITHUB_EVENT_NAME") == "push"
+    # The switch gates automatic push deploys only; a manual "Run workflow" on main always may deploy.
+    event = environ.get("GITHUB_EVENT_NAME")
+    return ((event == "workflow_dispatch" or (event == "push" and environ.get("ENABLE_AUTO_DEPLOY") == "true"))
             and environ.get("GITHUB_REF") == "refs/heads/main"
             and environ.get("GITHUB_REPOSITORY") == REPOSITORY
-            and environ.get("ENABLE_AUTO_DEPLOY") == "true"
             and environ.get("CI_VERIFY_RESULT") == "success")
 
 
