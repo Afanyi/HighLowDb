@@ -1,6 +1,7 @@
 """Manual stock-universe selection (CLI only; there is no web route).
 
     python universe_select.py select [--db PATH] [--out-dir DIR] [--resume]
+    python universe_select.py quick [--db PATH] [--out-dir DIR]
     python universe_select.py approve REVIEW_CSV [--db PATH]
 
 ``select`` screens every eligible Trading 212 stock on its verified home listing and writes a
@@ -533,6 +534,30 @@ def run_select(db_path: str, out_dir: Path, resume: bool = False, today: date | 
             "selected": len(selected), "review": str(review), "countries": str(countries)}
 
 
+def run_quick(out_dir: Path, instruments: list[dict] | None = None) -> dict:
+    """Placeholder universe from Trading 212 metadata only (no prices, not volatility-ranked).
+
+    Fills each country quota in ISIN order and writes the usual review files for ``approve``.
+    """
+    out_dir = _private_dir(out_dir)
+    groups, supply, _ = candidate_groups(instruments if instruments is not None else sync.fetch_instruments())
+    selected, summary = [], []
+    for country, quota in COUNTRY_QUOTAS.items():
+        isins = [isin for isin in groups if isin[:2] == country][:quota]
+        for rank, isin in enumerate(isins, 1):
+            line = min(groups[isin], key=lambda inst: inst["ticker"])
+            selected.append({"isin": isin, "country": country, "rank": rank, "ticker": line["ticker"],
+                             "name": line.get("name"), "volatility": 0.0, "eligible": True,
+                             "reason": "quick_placeholder"})
+        summary.append({"country": country, "quota": quota, "supply": supply.get(country, 0),
+                        "eligible": len(isins), "selected": len(isins), "unfilled": quota - len(isins),
+                        "reason": "too_few_priceable_lines" if len(isins) < quota else ""})
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    review, countries = write_review(out_dir, stamp, selected, selected, summary)
+    return {"review": str(review), "countries": str(countries), "selected": len(selected),
+            "unfilled": {r["country"]: r["unfilled"] for r in summary if r["unfilled"]}}
+
+
 def read_selected(review_csv: Path) -> list[dict]:
     """Validated SELECTED rows of a review CSV; raises ValueError on any inconsistency."""
     rows = []
@@ -590,6 +615,9 @@ def main(argv=None) -> int:
     select.add_argument("--db", default=sync.DB_PATH)
     select.add_argument("--out-dir", type=Path, help="private output directory (default: <db dir>/universe)")
     select.add_argument("--resume", action="store_true", help="reuse progress from an interrupted run")
+    quick = sub.add_parser("quick", help="write a placeholder review CSV from Trading 212 metadata only")
+    quick.add_argument("--db", default=sync.DB_PATH)
+    quick.add_argument("--out-dir", type=Path, help="private output directory (default: <db dir>/universe)")
     approve = sub.add_parser("approve", help="load a reviewed selection into universe_members")
     approve.add_argument("review_csv", type=Path)
     approve.add_argument("--db", default=sync.DB_PATH)
@@ -598,6 +626,8 @@ def main(argv=None) -> int:
     if args.command == "select":
         out_dir = args.out_dir or Path(args.db).resolve().parent / "universe"
         print(json.dumps(run_select(args.db, out_dir, resume=args.resume), indent=2))
+    elif args.command == "quick":
+        print(json.dumps(run_quick(args.out_dir or Path(args.db).resolve().parent / "universe"), indent=2))
     else:
         print(f"Approved {run_approve(args.review_csv, args.db)} members")
     return 0

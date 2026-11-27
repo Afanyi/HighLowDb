@@ -203,6 +203,67 @@ class TestDeployment(unittest.TestCase):
             data.check(backup)
         self.assertEqual(data.describe(source / data.NAMES[0])["counts"], {"sample": 1})
 
+    def test_only_the_reviewed_stock_migration_passes_the_data_check(self):
+        # Exact stocks DDL of the installed release, as stored by SQLite after its old migration.
+        legacy = ("CREATE TABLE stocks (\n                ticker TEXT PRIMARY KEY,\n                name TEXT,\n"
+                  "                exchange TEXT,\n                opening_price REAL,\n"
+                  "                year_max REAL,\n                year_min REAL,\n"
+                  "                all_time_max REAL,\n                all_time_min REAL,\n"
+                  "                status_tag TEXT,\n                last_updated TEXT\n            )")
+        backup = self.tmp / "backup"
+        backup.mkdir()
+        with closing(sqlite3.connect(backup / data.NAMES[0])) as conn, conn:
+            conn.execute(legacy)
+            conn.execute("ALTER TABLE stocks ADD COLUMN instrument_type TEXT NOT NULL DEFAULT 'STOCK'")
+            conn.execute("INSERT INTO stocks (ticker) VALUES ('AAPL_US_EQ')")
+        for name in data.NAMES[1:]:
+            with closing(sqlite3.connect(backup / name)) as conn, conn:
+                conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY)")
+        columns = [part.strip() for part in data.STOCK_COLUMNS.split(",") if part.strip()]
+        members = ("CREATE TABLE IF NOT EXISTS universe_members (\n    ticker TEXT PRIMARY KEY,\n"
+                   "    isin TEXT NOT NULL,\n    country TEXT NOT NULL,\n    rank INTEGER NOT NULL,\n"
+                   "    volatility REAL NOT NULL,\n    selected_at TEXT NOT NULL\n)")
+
+        def migrate(directory, extra=(), table=members):
+            with closing(sqlite3.connect(directory / data.NAMES[0])) as conn, conn:
+                existing = {row[1] for row in conn.execute("PRAGMA table_info(stocks)")}
+                for column in columns:
+                    if column.split()[0] not in existing:
+                        conn.execute("ALTER TABLE stocks ADD COLUMN " + column)
+                conn.execute(table)
+                for statement in extra:
+                    conn.execute(statement)
+
+        with patch.object(data, "initialize", side_effect=migrate):
+            report = data.check(backup)
+        self.assertEqual(report[data.NAMES[0]]["counts"], {"stocks": 1, "universe_members": 0})
+        self.assertEqual(data.describe(backup / data.NAMES[0])["counts"], {"stocks": 1})
+        migrated = self.tmp / "migrated"
+        shutil.copytree(backup, migrated)
+        migrate(migrated)
+        with patch.object(data, "initialize", side_effect=migrate):
+            data.check(migrated)  # Already migrated: no difference.
+        refused = (
+            ["ALTER TABLE stocks ADD COLUMN unreviewed TEXT"],
+            ["INSERT INTO stocks (ticker) VALUES ('NEW_US_EQ')"],
+            ["INSERT INTO universe_members VALUES ('AAPL_US_EQ','US0378331005','US',1,0.5,'now')"],
+            ["CREATE TABLE unreviewed (id INTEGER)"],
+            ["CREATE INDEX stocks_country ON stocks(country)"],
+        )
+        for extra in refused:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                with patch.object(data, "initialize", side_effect=lambda d: migrate(d, extra)):
+                    data.check(backup)
+        def other_database(directory):
+            migrate(directory)
+            with closing(sqlite3.connect(directory / data.NAMES[1])) as conn, conn:
+                conn.execute("ALTER TABLE sample ADD COLUMN extra INTEGER")
+        with patch.object(data, "initialize", side_effect=other_database), self.assertRaises(ValueError):
+            data.check(backup)
+        wrong_table = lambda d: migrate(d, table="CREATE TABLE universe_members (ticker TEXT PRIMARY KEY)")
+        with patch.object(data, "initialize", side_effect=wrong_table), self.assertRaises(ValueError):
+            data.check(backup)
+
     def test_failed_candidate_checks_do_not_touch_current_installation(self):
         root = self.tmp / "allstocksDatabase"
         release.prepare(ROOT, self.tmp / "stage")

@@ -13,6 +13,12 @@ sys.path.insert(0, "/app")  # This helper is mounted at /tools; providers belong
 
 
 NAMES = ("trading212_stocks.db", "crypto.db", "trading212_stocks.db.refresh.db")
+# Reviewed additive stock migration (stock plan Phase 4b); any other change still fails check.
+STOCK_COLUMNS = (", current_price REAL, price_date TEXT, isin TEXT, country TEXT,"
+                 " verification TEXT, quality_flags TEXT")
+UNIVERSE_MEMBERS = ("CREATE TABLE universe_members ( ticker TEXT PRIMARY KEY, isin TEXT NOT NULL,"
+                    " country TEXT NOT NULL, rank INTEGER NOT NULL, volatility REAL NOT NULL,"
+                    " selected_at TEXT NOT NULL )")
 
 
 def describe(path):
@@ -68,9 +74,26 @@ def check(directory):
         # root backup/check helpers must leave metadata owned by the current UID.
         initialize(restored)
         after = {name: describe(restored / name) for name in NAMES}
-        if before != after:
+        if before != after and not reviewed(before, after):
             raise ValueError("Database schema/count change requires a reviewed migration")
         return after
+
+
+def reviewed(before, after):
+    """True only for the reviewed stock migration: listed columns and an empty new table."""
+    if any(before[name] != after[name] for name in NAMES[1:]):
+        return False
+    old, new = before[NAMES[0]], after[NAMES[0]]
+    old_schema, new_schema = dict(map(tuple, old["schema"])), dict(map(tuple, new["schema"]))
+    new_counts = dict(new["counts"])
+    stocks = old_schema.pop("stocks", None)
+    if stocks is None or new_schema.pop("stocks", None) not in {stocks, stocks[:-1] + STOCK_COLUMNS + ")"}:
+        return False
+    if "universe_members" not in old_schema:
+        table = new_schema.pop("universe_members", "")
+        if " ".join(table.split()) != UNIVERSE_MEMBERS or new_counts.pop("universe_members", None) != 0:
+            return False
+    return old_schema == new_schema and old["counts"] == new_counts
 
 
 if __name__ == "__main__":

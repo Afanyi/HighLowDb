@@ -831,3 +831,36 @@ No Phase 3 acceptance criterion is marked passed. The phase and plan remain unfi
   CI/CD Phase 3 stays blocked. No approval was inferred, no workflow gate was weakened and
   no deployment or hosted rerun occurred. See the stock plan for the documented local
   refresh-metadata test side effect and its handling. Neither plan is ready for archival.
+
+#### Latest Published Phase 2 Candidate: Same Compatibility Blocker (2026-11-27)
+
+- Fresh hosted inventory confirms the owner has published the Phase 2 changes: `dev` push
+  [45992919847](https://github.com/Afanyi/HighLowDb/actions/runs/45992919847) and PR run
+  [45993016218](https://github.com/Afanyi/HighLowDb/actions/runs/45993016218) succeeded.
+  This supersedes the preceding note that the fixes were local/unpushed; no push was done
+  by the agent. Latest main source is `6d3af37470de46e14b488e5e722993294d708d2b`.
+- Main run [45993051015](https://github.com/Afanyi/HighLowDb/actions/runs/45993051015)
+  passed **Application and deployment checks** and failed **Deploy production**, job
+  `140486609832`, inside the updater for release `2638b1ea632b0956`. This is not a renewed
+  application-test failure or evidence that the repaired SSH key failed.
+- Read-only server inspection found the matching stage and backup
+  `20261127T114905-4317a0a6`. Re-running the candidate's existing compatibility check in a
+  network-disabled, read-only container against read-only backup mounts reproduced exit 1:
+  `ValueError: Database schema/count change requires a reviewed migration`. Temporary
+  initialization occurred only on disposable copies, with no live database volume mounted.
+- Installed release remains `c9bad96e9fd67e20`; the app is healthy with four days' uptime.
+  Phase 2 fixed stock code and tests; it did not perform the Phase 5 live migration or supply
+  release approval. Stock Phases 3–5 remain prerequisites, and CI/CD Phase 3 stays blocked.
+  This diagnosis performed no deployment rerun, migration, credential/settings change,
+  commit or push; the plan remains active.
+
+#### Owner Decision: Reviewed Schema Support in the Deploy Check (2026-11-27)
+
+- A read-only diff of release `2638b1ea632b0956` against a disposable copy of backup
+  `20261127T114905-4317a0a6` showed the refusal is caused only by the Phase 2 additive schema:
+  six nullable `stocks` columns and an empty `universe_members` table; row counts unchanged.
+- The owner chose to extend the deploy check to accept that exact reviewed migration
+  (tooling only). This is tracked as stock plan Phase 4b in `docs/PLAN_stock_db.md`, because
+  application/data changes are a non-goal of this plan. Stock Phase 5 now depends on it.
+- Production deployment still waits for stock Phase 5 approval: the new app shows stock
+  `current_price`, which would be empty on live data. CI/CD Phase 3 stays blocked.
