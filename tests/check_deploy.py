@@ -16,12 +16,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
 import manage
 import release
 import data
+import ci
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -230,7 +231,8 @@ class TestDeployment(unittest.TestCase):
         return result, log.read_text().splitlines()
 
     def test_cli_dry_run_never_uses_ssh_or_reads_environment(self):
-        result, log = self.fake_cli(["--dry-run", "--env", "/missing/private.env"])
+        result, log = self.fake_cli(["--dry-run", "--env", "/missing/private.env",
+                                     "--server-config", "/missing/private-ssh.env"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Dry run complete", result.stdout)
         self.assertTrue(all(line.endswith("docker") for line in log))
@@ -350,6 +352,240 @@ class TestDeployment(unittest.TestCase):
                 self.assertRaises(SystemExit):
             exec(compile(verifier, "transport-verifier", "exec", optimize=2), {})
         execute.assert_not_called()
+
+    def test_explicit_ci_settings_keep_local_config_and_pin_ssh_trust(self):
+        source = self.source_copy()
+        default = source / "deploy/server.env"
+        default.write_text("AS_HOST=-must-not-be-read\n")
+        default.chmod(0o600)
+        key, known, config = (self.tmp / name for name in ("key", "known_hosts", "ci.env"))
+        key.write_text("dummy-private-key")
+        known.write_text("server.example ssh-ed25519 dummy-public-key\n")
+        config.write_text("AS_HOST=ubuntu@server.example\nAS_KEY=" + str(key)
+                          + "\nAS_KNOWN_HOSTS=" + str(known) + "\n")
+        for path in (key, known, config):
+            path.chmod(0o600)
+        calls = []
+        def remote(command, **kwargs):
+            calls.append(command)
+            if command[0] == "ssh" and len(calls) == 1:
+                return "/home/ubuntu/" + manage.shlex.split(command[-1])[-1]
+            return ""
+        def temporary(**kwargs):
+            path = self.tmp / ("client-" + uuid.uuid4().hex)
+            path.mkdir(mode=0o700)
+            return str(path)
+        args = SimpleNamespace(command="update", env=None, dry_run=False, test_image="fixture:cached",
+                               drain_timeout=300, server_config=str(config))
+        with patch.object(manage, "__file__", str(source / "deploy/manage.py")), \
+                patch.object(manage, "image_tests") as tests, \
+                patch.object(manage, "run", side_effect=remote), \
+                patch.object(manage.tempfile, "mkdtemp", side_effect=temporary), redirect_stdout(io.StringIO()):
+            manage.local(args)
+            tests.assert_called_once()
+            self.assertEqual([call[0] for call in calls], ["ssh", "scp", "ssh", "ssh"])
+            for call in calls:
+                for option in ("StrictHostKeyChecking=yes", "UserKnownHostsFile=" + str(known),
+                               "GlobalKnownHostsFile=/dev/null", "IdentitiesOnly=yes", "IdentityAgent=none"):
+                    self.assertIn(option, call)
+                self.assertEqual(call[call.index("-F") + 1], "/dev/null")
+                self.assertEqual(call[call.index("-i") + 1], str(key))
+            self.assertEqual(default.read_text(), "AS_HOST=-must-not-be-read\n")
+            calls.clear()
+            known.chmod(0o644)
+            with self.assertRaises(ValueError):
+                manage.local(args)
+            self.assertEqual(calls, [])
+
+
+class TestCiDeployment(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="allstocks-ci-deploy-test-")))
+        self.root = self.tmp / "repo"
+        self.root.mkdir()
+        self.execute_real = subprocess.run
+        key = self.tmp / "fixture-key"
+        self.execute_real(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                          capture_output=True, check=True)
+        self.sha, self.release = "a" * 40, "b" * 16
+        self.env = {
+            "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main",
+            "GITHUB_REPOSITORY": ci.REPOSITORY, "GITHUB_SHA": self.sha,
+            "ENABLE_AUTO_DEPLOY": "true", "CI_VERIFY_RESULT": "success",
+            "GH_TOKEN": "dummy-read-token", "DEPLOY_HOST": "server.example",
+            "DEPLOY_SSH_KEY": key.read_text(),
+            "DEPLOY_KNOWN_HOSTS": "server.example " + key.with_suffix(".pub").read_text(),
+            "GITHUB_STEP_SUMMARY": str(self.tmp / "summary"),
+        }
+        self.head, self.dirty, self.api_heads = self.sha, "", [self.sha, self.sha]
+        self.commands, self.private_dirs = [], set()
+        self.updater_exit, self.build_exit = 0, 0
+        self.updater_output = "Reviewed release " + self.release + ": /private/fixture\n"
+
+    def execute(self, command, **kwargs):
+        self.commands.append(command)
+        for name in ("DEPLOY_SSH_KEY", "DEPLOY_KNOWN_HOSTS", "GH_TOKEN", "GITHUB_TOKEN"):
+            self.assertNotIn(name, kwargs.get("env", {}))
+        if command[:3] == ["git", "rev-parse", "HEAD"]:
+            output, code = self.head, 0
+        elif command[:2] == ["git", "status"]:
+            output, code = self.dirty, 0
+        elif command[0] == "ssh-keygen":
+            path = Path(command[-1])
+            self.private_dirs.add(path.parent)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            return self.execute_real(command, **kwargs)
+        elif command[0] == "docker":
+            self.assertEqual(command[1:4], ["--host", "unix:///var/run/docker.sock", "build"])
+            output, code = "", self.build_exit
+        elif command[0] == "bash":
+            self.assertEqual(command[:3], ["bash", str(self.root / "deploy/update.sh"), "--server-config"])
+            self.assertEqual(len(command), 4)
+            cfg = manage.settings(Path(command[3]), {"AS_HOST", "AS_KEY", "AS_KNOWN_HOSTS"})
+            self.assertEqual(cfg["AS_HOST"], "ubuntu@server.example")
+            self.assertTrue(Path(cfg["AS_KEY"]).is_file())
+            self.assertTrue(Path(cfg["AS_KNOWN_HOSTS"]).is_file())
+            output, code = self.updater_output, self.updater_exit
+        else:
+            raise AssertionError("Unexpected tool: " + command[0])
+        return subprocess.CompletedProcess(command, code, stdout=output, stderr="dummy-private-tool-error")
+
+    def api(self, request, **kwargs):
+        self.assertEqual(request.full_url, "https://api.github.com/repos/Afanyi/HighLowDb/git/ref/heads/main")
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"object": {"sha": self.api_heads.pop(0)}}).encode()
+        return response
+
+    def run_ci(self):
+        self.commands.clear()
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), patch.object(ci, "ROOT", self.root), \
+                patch.object(ci.subprocess, "run", side_effect=self.execute), \
+                patch.object(ci.urllib.request, "urlopen", side_effect=self.api) as api, \
+                redirect_stdout(out), patch("sys.stderr", err):
+            code = ci.main()
+        self.assertTrue(all(not path.exists() for path in self.private_dirs))
+        combined = out.getvalue() + err.getvalue()
+        if self.env.get("DEPLOY_SSH_KEY"):
+            self.assertNotIn(self.env["DEPLOY_SSH_KEY"], combined)
+        self.assertNotIn("dummy-private-tool-error", combined)
+        self.assertNotIn("dummy-read-token", combined)
+        return code, combined, api.call_count
+
+    def test_success_reuses_updater_reports_identity_and_cleans_private_files(self):
+        code, output, api_calls = self.run_ci()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(api_calls, 2)
+        self.assertIn(self.sha, output)
+        self.assertIn(self.release, output)
+        self.assertIn("**succeeded**", (self.tmp / "summary").read_text())
+        self.assertEqual(len([c for c in self.commands if c[0] == "bash"]), 1)
+
+    def test_ineligible_runs_never_prepare_credentials_build_or_update(self):
+        for name, value in (("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+                            ("GITHUB_REF", "refs/heads/dev"), ("GITHUB_REF", "refs/heads/feature/example"),
+                            ("GITHUB_REF", "refs/tags/main"), ("GITHUB_REPOSITORY", "other/fork"),
+                            ("ENABLE_AUTO_DEPLOY", "false"), ("ENABLE_AUTO_DEPLOY", ""),
+                            ("CI_VERIFY_RESULT", "failure"), ("CI_VERIFY_RESULT", "skipped"),
+                            ("CI_VERIFY_RESULT", "cancelled"), ("CI_VERIFY_RESULT", "")):
+            with self.subTest(name=name, value=value):
+                original = self.env[name]
+                self.env[name] = value
+                try:
+                    code, _, api_calls = self.run_ci()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(api_calls, 0)
+                    self.assertEqual(self.commands, [])
+                finally:
+                    self.env[name] = original
+
+    def test_old_commit_is_rejected_before_credential_materialization(self):
+        self.api_heads = ["f" * 40]
+        code, _, _ = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertTrue(all(c[0] == "git" for c in self.commands))
+        self.assertEqual(self.private_dirs, set())
+
+    def test_main_advancing_during_build_prevents_updater_and_cleans_key(self):
+        self.api_heads = [self.sha, "f" * 40]
+        code, _, api_calls = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertEqual(api_calls, 2)
+        self.assertTrue(any(c[0] == "docker" for c in self.commands))
+        self.assertFalse(any(c[0] == "bash" for c in self.commands))
+
+    def test_wrong_checkout_and_dirty_worktree_stop_before_api_or_build(self):
+        for head, dirty in (("f" * 40, ""), (self.sha, " M app.py")):
+            with self.subTest(head=head, dirty=dirty):
+                self.head, self.dirty = head, dirty
+                code, _, api_calls = self.run_ci()
+                self.assertEqual(code, 1)
+                self.assertEqual(api_calls, 0)
+                self.assertTrue(all(c[0] == "git" for c in self.commands))
+
+    def test_missing_settings_fail_without_build_or_update(self):
+        for name in ("DEPLOY_HOST", "DEPLOY_SSH_KEY", "DEPLOY_KNOWN_HOSTS", "GH_TOKEN"):
+            with self.subTest(name=name):
+                original = self.env[name]
+                self.env[name] = ""
+                self.api_heads = [self.sha]
+                try:
+                    code, _, _ = self.run_ci()
+                    self.assertEqual(code, 1)
+                    self.assertTrue(all(c[0] == "git" for c in self.commands))
+                finally:
+                    self.env[name] = original
+
+    def test_known_host_mismatch_and_fingerprint_are_rejected_before_build(self):
+        for known in ("SHA256:fingerprint-is-not-a-host-entry", self.env["DEPLOY_KNOWN_HOSTS"].replace("server.example", "wrong.example")):
+            with self.subTest(known=known.split()[0]):
+                self.env["DEPLOY_KNOWN_HOSTS"] = known
+                self.api_heads = [self.sha]
+                code, _, _ = self.run_ci()
+                self.assertEqual(code, 1)
+                self.assertFalse(any(c[0] in {"docker", "bash"} for c in self.commands))
+
+    def test_hashed_known_hosts_are_supported(self):
+        known = self.tmp / "hashed-hosts"
+        known.write_text(self.env["DEPLOY_KNOWN_HOSTS"])
+        self.execute_real(["ssh-keygen", "-H", "-f", str(known)], capture_output=True, check=True)
+        self.env["DEPLOY_KNOWN_HOSTS"] = known.read_text()
+        code, output, _ = self.run_ci()
+        self.assertEqual(code, 0, output)
+
+    def test_bad_private_key_is_rejected_before_build_and_not_logged(self):
+        self.env["DEPLOY_SSH_KEY"] = "invalid-test-private-key"
+        code, _, _ = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[0] in {"docker", "bash"} for c in self.commands))
+
+    def test_unavailable_github_api_cannot_allow_deployment(self):
+        with patch.object(self, "api", side_effect=OSError("dummy-read-token")):
+            code, _, api_calls = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertEqual(api_calls, 1)
+        self.assertTrue(all(c[0] == "git" for c in self.commands))
+
+    def test_failed_build_cleans_credentials_without_starting_update(self):
+        self.build_exit = 17
+        code, _, _ = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[0] == "bash" for c in self.commands))
+
+    def test_failed_update_is_failure_and_preserves_safe_release_identity(self):
+        self.updater_exit = 19
+        self.updater_output += "Deployment stopped: TimeoutError: dummy-private-tool-error\n"
+        code, output, _ = self.run_ci()
+        self.assertEqual(code, 1)
+        self.assertIn(self.release, output)
+        self.assertIn("**failed**", (self.tmp / "summary").read_text())
+
+    def test_update_without_release_confirmation_cannot_be_success(self):
+        self.updater_output = ""
+        code, _, _ = self.run_ci()
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

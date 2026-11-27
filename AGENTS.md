@@ -10,12 +10,19 @@ These rules apply to Claude Code, OpenCode, Codex and any other coding agent in 
 ## One active plan
 
 - Only one active plan may exist at a time: one `docs/PLAN_*.md` file.
+- **Exception:** one additional active `docs/PLAN_*.md` file may coexist solely for the
+  GitHub Actions CI/CD work: run tests automatically on all branches and pull requests, and
+  automatically deploy only from `main` after every required check passes. Local/manual
+  deployment must also remain supported, subject
+  to the existing deployment checks and security gates.
 - Plans in `docs/done/` are finished or archived. Plans in `docs/todo/` are not active.
 - Before creating a plan, check for an existing active plan and apply the rules below.
 
 ## Source of truth
 
-- All work must follow the current active plan.
+- All work must follow the current active plan for its scope. When the CI/CD exception is
+  used, its plan governs CI/CD work and the existing plan continues to govern its own scope.
+  Resolve overlapping requirements explicitly in both plans before implementation.
 - If anything conflicts with it, the active plan's setting wins. This includes older plans, migrated
   phases, README text, other docs, existing code behavior and earlier decisions.
 - Within the active plan, its newest explicit owner decision and current design win over older or
@@ -45,6 +52,9 @@ to `docs/done/` in the same task, then update any references to its old path, in
 `deploy/release.py`.
 
 ## Replacing an unfinished plan
+
+Adding the CI/CD plan under the exception above does not replace the existing active plan
+and does not require migrating or archiving it.
 
 When a new plan replaces an unfinished active plan:
 

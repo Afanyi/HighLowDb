@@ -25,8 +25,10 @@ def run(*args, **kwargs):
 
 
 def main():
-    # --no-env-resolution prevents reading the service's real env_file.
+    # Select an empty service env_file too: Compose 2.x checks it exists even
+    # with --no-env-resolution. Never depend on or read a checkout's real .env.
     environ = os.environ | {
+        "APP_ENV_FILE": os.devnull,
         "APP_RELEASE": "phase1-test", "APP_PUBLIC_ORIGIN": "https://stocks.skyboyz1.duckdns.org",
         "APP_SECRET_KEY": "phase1-test-only-not-a-production-secret",
     }

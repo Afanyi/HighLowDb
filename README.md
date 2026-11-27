@@ -34,6 +34,37 @@ Tests: `docker compose run --rm app python -m unittest`
 
 **Security:** the app is bound to `127.0.0.1` only and requires a form token for manual syncs. Do not expose port 8000 publicly without an authenticated HTTPS reverse proxy.
 
+## Automated verification
+
+GitHub Actions runs the **Application and deployment checks** job on pushes to every branch
+(including names such as `feature/example`) and on pull requests targeting any branch.
+Tag pushes are excluded. Every check is required: a failure stops verification and fails the job.
+Testing does not depend on `ENABLE_AUTO_DEPLOY` or any deployment secret.
+
+Run the same checks locally from the repository root:
+
+```sh
+bash tests/check_ci.sh
+```
+
+Requires Linux, Bash, Python 3.11+ and Docker with Compose >= 2.24 and support for
+`config --no-env-resolution`. The script uses the local Unix Docker socket, downloads test
+images and builds the existing app image as `allstocksdatabase-app:latest`.
+It runs CI runner regression tests, offline application unittests, host deployment tests,
+an isolated Docker setup/update/rollback/recovery drill, HTTPS/login/CSRF smoke checks and a
+packaged-release dry run.
+The host-side checks use only Python's standard library; application dependencies stay in Docker.
+
+Tests use dummy credentials and disposable databases. They need no `.env`, SSH key or production
+access. The drills remove only their own temporary resources; test images/build cache and the
+private release dry-run directory may remain for inspection. Local development and manual server
+deployment commands remain available. Automatic deployment is disabled unless the repository
+variable `ENABLE_AUTO_DEPLOY` is exactly `true`; leave it `false` until CI/CD Phase 3 validation.
+Only a `main` push whose verification succeeds can enter the `production` deployment job.
+The job rejects superseded commits, serializes automatic updates and runs the existing updater
+with temporary SSH credentials. Application/provider secrets stay in the server's private `.env`.
+See [deployment settings and failure handling](deploy/ROLLOUT.md#github-actions-deployment).
+
 ## Server deployment preparation
 
 The [deployment plan](docs/done/PLAN_deployment.md) targets the existing TradingSupport
@@ -41,7 +72,7 @@ server. [Production configuration notes](docs/deployment.md) describe the privat
 Compose upstream and the proposed route for its existing Caddy proxy. These files
 prepare deployment. Manual setup/update scripts are documented in
 [deploy/ROLLOUT.md](deploy/ROLLOUT.md); the live rollout remains Phase 4.
-Code deployment stays manual. Automatic stock-data updates continue to use the
+Code deployment supports both the local updater and guarded GitHub Actions. Automatic stock-data updates continue to use the
 existing weekday `SYNC_TIME_UTC` scheduler, independently of browser access.
 
 The dashboard shows the next scheduled refresh, last attempt, last successful

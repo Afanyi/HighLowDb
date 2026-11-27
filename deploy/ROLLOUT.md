@@ -1,17 +1,24 @@
-# Manual deployment to TradingSupport
+# Deployment to TradingSupport
 
 These scripts are Phase 3 tooling. Running them without `--dry-run` performs a
-deployment; Phase 4 is the live rollout. There is no Git/image polling, deployment
-timer or automatic code update. Stock data still updates automatically on weekdays,
+deployment; Phase 4 is the live rollout. Local/manual deployment remains available, and
+guarded GitHub Actions deployment is described below. There is no Git/image polling or
+deployment timer. Stock data still updates automatically on weekdays,
 and crypto data daily, using the existing configured schedules.
 
 ## Prepare locally
 
 Build the local dependency image once (`docker compose build`). Keep the real
 `.env` private and outside release artifacts. Create `deploy/server.env` from
-`deploy/server.env.example`, mode 0600. It contains only `AS_HOST=live` and the
+`deploy/server.env.example`, mode 0600. It contains `AS_HOST=live` and the
 existing `AS_KEY` path; settings are parsed as literals, never sourced. The SSH
 alias must already have a verified host key; the scripts require strict checking.
+
+`--server-config /absolute/path/to/private-ssh.env` selects a different private SSH settings
+file without changing `deploy/server.env`. Its optional `AS_KNOWN_HOSTS` setting names a private
+verified host-key file and requires `AS_KEY`. With explicit host trust, SSH ignores user/global
+SSH configuration and agents, uses that key and trust file only, and retains strict checking.
+Use a direct `ubuntu@hostname` target in that case; local aliases remain supported by default.
 
 ```sh
 bash deploy/update.sh --dry-run
@@ -173,3 +180,57 @@ socket is never mounted into the application. No SSH or production credentials
 are used; runtime fixture networks are internal. The driver removes only its
 temporary containers, volume, network and fixture directory; namespaced test image
 tags/build cache may remain for inspection.
+
+## GitHub Actions deployment
+
+The workflow runs verification on every branch push and PR. Its deployment job needs a successful
+verification of the same event commit, a `push` to `refs/heads/main` and repository variable
+`ENABLE_AUTO_DEPLOY` equal to `true`. An unset/false switch disables deployment without affecting
+tests. Keep it `false` during CI/CD Phase 2; activation and production validation belong to Phase 3.
+
+Configure these settings privately in GitHub; they are not files to commit:
+
+| Setting | Location | Value |
+| --- | --- | --- |
+| `ENABLE_AUTO_DEPLOY` | Repository Actions variable | `false` until Phase 3 validation; `true` enables eligible future jobs |
+| `DEPLOY_HOST` | `production` environment variable | Reachable server DNS name or IPv4 address, without user/port; SSH user is `ubuntu` |
+| `DEPLOY_KNOWN_HOSTS` | `production` environment variable | Complete verified host-key entries matching `DEPLOY_HOST`; hashed entries work |
+| `DEPLOY_SSH_KEY` | `production` environment secret | Complete dedicated, unencrypted SSH private key; its public key must already be authorized for `ubuntu` |
+
+Restrict the `production` environment to branch `main` where supported. Environment/protection
+availability and actual server reachability must be verified before activation. The built-in
+read-only GitHub token checks `main`; no additional personal access token or provider API key is
+needed in GitHub. Keep the real application `.env` on the server. CI never calls first setup,
+passes `--env`, replaces provider credentials or bypasses migration/report approval requirements.
+
+`deploy/ci.py` also checks eligibility, a clean checkout of the event SHA and current remote
+`main`, failing closed if GitHub cannot confirm it. It validates the supplied SSH key and host
+entry, builds the existing local dependency image and rechecks `main` before invoking
+`bash deploy/update.sh --server-config ...`. Source archives still pass the updater's offline
+tests locally and the target host's candidate tests, lock, drain, backup, compatibility, health
+and rollback gates. The target builds its own architecture's image. The client-only CI helper
+is allowlisted with the deployment tools; no runtime service or dependency was added.
+
+The SSH key, host-key file and settings file exist only in a temporary private directory and
+are removed on normal completion or a handled failure. They never overwrite local SSH/app
+configuration. Child tools receive no CI private-key value or GitHub token in their environment;
+the updater receives private file paths. Logs and the Actions summary show only source SHA,
+candidate release ID, outcome and the failed stage, excluding raw tool output and secrets.
+
+Automatic jobs share one concurrency group with `cancel-in-progress: false`; local and CI
+clients also share the server's existing deployment lock. A superseded queued revision or old
+rerun fails the `main` check. If `main` advances during an update already under way, that update
+may finish before the next eligible revision. The queue may replace older pending jobs.
+Do not manually cancel a cutover: if a job/runner is interrupted, inspect actual server state
+and retained recovery records before retrying. The ephemeral runner is discarded after its job.
+
+A failed/missing/skipped/cancelled required check prevents the deployment job. Invalid trust,
+build failure, lock contention, drain timeout, migration refusal and failed cutover/rollback
+remain failures; the workflow never retries automatically or reports them as success. For an
+updater-stage failure, inspect the server state and use the existing local update/recovery
+procedure; raw server/Docker output is deliberately excluded from shared Actions logs.
+
+Setting `ENABLE_AUTO_DEPLOY=false` prevents future automatic jobs; it does not cancel a running
+update. `bash deploy/update.sh`, `--dry-run` and explicit recovery remain independent of GitHub,
+its token and enablement switch. Local production updates still run mandatory packaged-source
+and server-candidate tests before cutover. Local development Compose usage is unchanged.

@@ -16,7 +16,7 @@ FILES = (
     "tests/__init__.py", "tests/test_app.py", "tests/test_sync.py", "tests/test_crypto_sync.py", "tests/test_refresh.py",
     "tests/test_universe_select.py",
     "tests/check_production.py", "tests/check_deploy.py", "deploy/setup.sh", "deploy/update.sh",
-    "deploy/manage.py", "deploy/release.py", "deploy/data.py", "deploy/server.env.example", "deploy/Caddyfile.stocks",
+    "deploy/manage.py", "deploy/ci.py", "deploy/release.py", "deploy/data.py", "deploy/server.env.example", "deploy/Caddyfile.stocks",
     "deploy/ROLLOUT.md", "docs/deployment.md", "docs/done/PLAN_deployment.md",
 )
 LIMIT = 8 * 1024 * 1024
